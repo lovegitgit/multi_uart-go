@@ -181,7 +181,7 @@ func main() {
 	}
 	fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
 	fmt.Printf(" 💡 [交互模式] 终端输入命令按回车可广播; 输入 Alias: cmd 或 COMx: cmd 可定向发送\n")
-	fmt.Printf(" 💡 [系统指令] 输入 SYS: help 查看帮助, SYS: cls 清理屏幕\n")
+	fmt.Printf(" 💡 [系统指令] 输入 SYS: help 查看帮助\n")
 	fmt.Printf("=======================================================================\n\n")
 
 	logChan := make(chan LogMessage, 10000)
@@ -444,22 +444,13 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 		cmdLower := strings.ToLower(cmdStr)
 		if cmdLower == "help" || cmdLower == "?" {
 			printCommandHelp(logChan)
-		} else if cmdLower == "cls" || cmdLower == "clear" {
-			fmt.Print("\033[H\033[2J") // Clear local screen ANSI
-			logChan <- LogMessage{
-				PortName:  "SYS",
-				Direction: "SYS",
-				ColorCode: "\033[1;37m",
-				Timestamp: time.Now(),
-				Content:   "🧹 屏幕已清理",
-			}
 		} else {
 			logChan <- LogMessage{
 				PortName:  "SYS",
 				Direction: "SYS",
 				ColorCode: "\033[1;31m",
 				Timestamp: time.Now(),
-				Content:   "❌ 未知的系统命令。支持: SYS: help, SYS: cls",
+				Content:   "❌ 未知的系统命令。支持: SYS: help",
 			}
 		}
 		return
@@ -749,7 +740,6 @@ func printCommandHelp(logChan chan<- LogMessage) {
 		"     - 直接输入命令: reset           (向所有打开的串口广播发送 reset)",
 		"  3. 系统指令 (SYS 前缀):",
 		"     - 查看帮助: SYS: help",
-		"     - 清理屏幕: SYS: cls",
 		"-----------------------------------------------------------------------",
 	}
 	
