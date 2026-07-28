@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"go.bug.st/serial"
+	"golang.org/x/term"
 )
 
 // ANSI Color Palette for distinct terminal visual identification
@@ -43,6 +45,8 @@ var (
 	telnetClientsMutex sync.Mutex
 	telnetClients      = make(map[net.Conn]bool)
 	hexMode            bool
+
+	origTerminalState *term.State
 )
 
 // LogMessage represents a framed log line from a specific port
@@ -67,6 +71,10 @@ func (m *MultiPortFlag) Set(value string) error {
 }
 
 func main() {
+	if st, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
+		origTerminalState = st
+		defer term.Restore(int(os.Stdin.Fd()), st)
+	}
 	var portFlags MultiPortFlag
 	var logFile string
 	var listenAddr string
@@ -181,7 +189,8 @@ func main() {
 	}
 	fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
 	fmt.Printf(" 💡 [交互模式] 终端输入命令按回车可广播; 输入 Alias: cmd 或 COMx: cmd 可定向发送\n")
-	fmt.Printf(" 💡 [系统指令] 输入 SYS: help 查看帮助\n")
+	fmt.Printf(" 💡 [交互模式] 终端所有输入 (含 exit, help, ctrl-c) 均百分百透传下发给串口\n")
+	fmt.Printf(" 💡 [退出程序] 按 Ctrl+[ (或输入 ctrl+[) 为 multi_uart_logger 唯一的退出指令\n")
 	fmt.Printf("=======================================================================\n\n")
 
 	logChan := make(chan LogMessage, 10000)
@@ -209,6 +218,35 @@ func main() {
 
 	// 2. Start Console Interactive Command Reader (Broadcast or Target Command)
 	go startStdinCommandReader(&activePorts, logChan)
+
+	// Trap SIGINT (Ctrl+C) and forward 0x03 to active UART devices instead of exiting
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		for sig := range sigChan {
+			ctrlBytes := []byte{0x03}
+			sigName := "Ctrl+C (SIGINT)"
+			if sig != os.Interrupt {
+				ctrlBytes = []byte{0x1C}
+				sigName = "SIGTERM"
+			}
+			count := 0
+			activePorts.Range(func(key, value any) bool {
+				if p, ok := value.(serial.Port); ok {
+					_, _ = p.Write(ctrlBytes)
+					count++
+				}
+				return true
+			})
+			logChan <- LogMessage{
+				PortName:  "SYS",
+				Direction: "SYS",
+				ColorCode: "\033[1;35m",
+				Timestamp: time.Now(),
+				Content:   fmt.Sprintf("📢 [捕获系统信号 %s] 已向 %d 个串口透传广播下发 0x%02X。退出程序请输入 'exit' 或 'q'", sigName, count, ctrlBytes[0]),
+			}
+		}
+	}()
 
 	// 2.5 Start Telnet Server if requested
 	if listenAddr != "" {
@@ -314,152 +352,349 @@ func parseSerialConfigs(args []string, defaultBaud int) []SerialConfig {
 	return results
 }
 
-// Dedicated port pipeline reading raw bytes and emitting framed LogMessages
+// Dedicated port pipeline reading raw bytes, handling auto-reconnect, and emitting framed LogMessages
 func startPortPipeline(portName string, alias string, baudRate int, colorCode string, logChan chan<- LogMessage, activePorts *sync.Map) {
 	mode := &serial.Mode{
 		BaudRate: baudRate,
 	}
 
-	port, err := serial.Open(portName, mode)
-	if err != nil {
-		log.Printf("❌ [%s] 打开物理串口 %s 失败: %v", alias, portName, err)
-		return
-	}
-	defer port.Close()
-
-	activePorts.Store(alias, port)
-	defer activePorts.Delete(alias)
-
-	if alias == portName {
-		log.Printf("✅ [%s] 串口连接成功 (%d baud)", alias, baudRate)
-	} else {
-		log.Printf("✅ [%s] 串口连接成功 (物理端口 %s, %d baud)", alias, portName, baudRate)
-	}
-
-	buf := make([]byte, 4096)
-	var lineBuf bytes.Buffer
-
-	// --- Hex Mode Timer-based Flush ---
-	hexRxChan := make(chan []byte, 100)
-	if hexMode {
-		go func() {
-			var hexBuf []byte
-			timer := time.NewTimer(30 * time.Millisecond)
-			if !timer.Stop() {
-				<-timer.C
+	firstAttempt := true
+	for {
+		port, err := serial.Open(portName, mode)
+		if err != nil {
+			if firstAttempt {
+				logChan <- LogMessage{
+					PortName:  alias,
+					Direction: "SYS",
+					ColorCode: "\033[1;31m",
+					Timestamp: time.Now(),
+					Content:   fmt.Sprintf("❌ 打开物理串口 %s 失败: %v (已启动后台自动重连监测...)", portName, err),
+				}
+				firstAttempt = false
 			}
-			for {
-				select {
-				case chunk, ok := <-hexRxChan:
-					if !ok {
-						return // Port closed, exit
-					}
-					hexBuf = append(hexBuf, chunk...)
-					timer.Reset(30 * time.Millisecond) // Flush after 30ms of silence
-				case <-timer.C:
-					if len(hexBuf) > 0 {
-						var sb strings.Builder
-						for j, b := range hexBuf {
-							if j > 0 {
-								sb.WriteByte(' ')
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		activePorts.Store(alias, port)
+
+		if alias == portName {
+			logChan <- LogMessage{
+				PortName:  alias,
+				Direction: "SYS",
+				ColorCode: "\033[1;32m",
+				Timestamp: time.Now(),
+				Content:   fmt.Sprintf("✅ 串口连接成功 (%d baud)", baudRate),
+			}
+		} else {
+			logChan <- LogMessage{
+				PortName:  alias,
+				Direction: "SYS",
+				ColorCode: "\033[1;32m",
+				Timestamp: time.Now(),
+				Content:   fmt.Sprintf("✅ 串口连接成功 (物理端口 %s, %d baud)", portName, baudRate),
+			}
+		}
+
+		buf := make([]byte, 4096)
+		var lineBuf bytes.Buffer
+
+		// --- Hex Mode Timer-based Flush ---
+		hexRxChan := make(chan []byte, 100)
+		hexDoneChan := make(chan struct{})
+
+		if hexMode {
+			go func() {
+				defer close(hexDoneChan)
+				var hexBuf []byte
+				timer := time.NewTimer(30 * time.Millisecond)
+				if !timer.Stop() {
+					<-timer.C
+				}
+				for {
+					select {
+					case chunk, ok := <-hexRxChan:
+						if !ok {
+							return // Port closed, exit goroutine
+						}
+						hexBuf = append(hexBuf, chunk...)
+						timer.Reset(30 * time.Millisecond) // Flush after 30ms of silence
+					case <-timer.C:
+						if len(hexBuf) > 0 {
+							var sb strings.Builder
+							for j, b := range hexBuf {
+								if j > 0 {
+									sb.WriteByte(' ')
+								}
+								fmt.Fprintf(&sb, "%02X", b)
 							}
-							fmt.Fprintf(&sb, "%02X", b)
+							logChan <- LogMessage{
+								PortName:  alias,
+								Direction: "RX",
+								ColorCode: colorCode,
+								Timestamp: time.Now(),
+								Content:   sb.String(),
+							}
+							hexBuf = hexBuf[:0]
 						}
-						logChan <- LogMessage{
-							PortName:  alias,
-							Direction: "RX",
-							ColorCode: colorCode,
-							Timestamp: time.Now(),
-							Content:   sb.String(),
-						}
-						hexBuf = hexBuf[:0]
 					}
 				}
+			}()
+		}
+
+		// Read loop
+		for {
+			n, readErr := port.Read(buf)
+			if readErr != nil {
+				logChan <- LogMessage{
+					PortName:  alias,
+					Direction: "SYS",
+					ColorCode: "\033[1;33m",
+					Timestamp: time.Now(),
+					Content:   fmt.Sprintf("⚠️ 串口断开: %v (等待热插拔重连...)", readErr),
+				}
+				break
+			}
+			if n > 0 {
+				now := time.Now()
+				chunk := buf[:n]
+
+				if hexMode {
+					hexRxChan <- append([]byte(nil), chunk...)
+				} else {
+					lineBuf.Write(chunk)
+
+					for {
+						lineBytes, e := lineBuf.ReadBytes('\n')
+						if e != nil {
+							// Put uncompleted line snippet back into buffer for next read
+							lineBuf.Write(lineBytes)
+							break
+						}
+
+						content := strings.TrimRight(string(lineBytes), "\r\n")
+						if content != "" {
+							logChan <- LogMessage{
+								PortName:  alias,
+								Direction: "RX",
+								ColorCode: colorCode,
+								Timestamp: now,
+								Content:   content,
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if hexMode {
+			close(hexRxChan)
+			<-hexDoneChan
+		}
+
+		port.Close()
+		activePorts.Delete(alias)
+
+		firstAttempt = false
+		time.Sleep(2 * time.Second) // Pause 2 seconds before attempting auto-reconnect
+	}
+}
+
+// Read stdin byte-by-byte in RAW terminal mode for instant non-canonical keypress & hotkey handling
+func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
+	buf := make([]byte, 1)
+	var lineBuf bytes.Buffer
+	var history []string
+	historyIdx := -1
+
+	readLineBytes := func(timeout time.Duration) (byte, bool) {
+		ch := make(chan byte, 1)
+		go func() {
+			var b [1]byte
+			if n, err := os.Stdin.Read(b[:]); err == nil && n > 0 {
+				ch <- b[0]
 			}
 		}()
+		select {
+		case b := <-ch:
+			return b, true
+		case <-time.After(timeout):
+			return 0, false
+		}
 	}
-	defer close(hexRxChan)
-	// ----------------------------------
 
 	for {
-		n, err := port.Read(buf)
+		n, err := os.Stdin.Read(buf)
 		if err != nil {
-			log.Printf("⚠️ [%s] 串口读取异常断开: %v", alias, err)
-			return
+			time.Sleep(20 * time.Millisecond)
+			continue
 		}
 		if n > 0 {
-			now := time.Now()
-			chunk := buf[:n]
+			b := buf[0]
 
-			if hexMode {
-				// Send chunk to our timeout-buffer instead of immediately printing
-				hexRxChan <- append([]byte(nil), chunk...)
-			} else {
-				lineBuf.Write(chunk)
+			// Instant Quit Hotkey: Ctrl+] (0x1D)
+			if b == 0x1D {
+				if origTerminalState != nil {
+					_ = term.Restore(int(os.Stdin.Fd()), origTerminalState)
+				}
+				logChan <- LogMessage{
+					PortName:  "SYS",
+					Direction: "SYS",
+					ColorCode: "\033[1;33m",
+					Timestamp: time.Now(),
+					Content:   "👋 捕获到 Ctrl+] 退出快捷键，正在退出 multi_uart_logger...",
+				}
+				time.Sleep(100 * time.Millisecond)
+				os.Exit(0)
+			}
 
-				for {
-					lineBytes, err := lineBuf.ReadBytes('\n')
-					if err != nil {
-						// Put uncompleted line snippet back into buffer for next read
-						lineBuf.Write(lineBytes)
-						break
+			// Handle ESC (0x1B / Ctrl+[) vs ANSI Escape Sequences (Arrow Keys)
+			if b == 0x1B {
+				b2, ok2 := readLineBytes(10 * time.Millisecond)
+				if !ok2 {
+					// Standalone ESC / Ctrl+[ -> Exit program!
+					if origTerminalState != nil {
+						_ = term.Restore(int(os.Stdin.Fd()), origTerminalState)
 					}
+					logChan <- LogMessage{
+						PortName:  "SYS",
+						Direction: "SYS",
+						ColorCode: "\033[1;33m",
+						Timestamp: time.Now(),
+						Content:   "👋 捕获到 Ctrl+[ (ESC) 退出快捷键，正在退出 multi_uart_logger...",
+					}
+					time.Sleep(100 * time.Millisecond)
+					os.Exit(0)
+				}
 
-					content := strings.TrimRight(string(lineBytes), "\r\n")
-					if content != "" {
-						logChan <- LogMessage{
-							PortName:  alias,
-							Direction: "RX",
-							ColorCode: colorCode,
-							Timestamp: now,
-							Content:   content,
+				if b2 == '[' || b2 == 'O' {
+					b3, ok3 := readLineBytes(10 * time.Millisecond)
+					if ok3 {
+						if b3 == 'A' { // Up Arrow -> Recall Previous Command
+							if len(history) > 0 {
+								if historyIdx == -1 {
+									historyIdx = len(history) - 1
+								} else if historyIdx > 0 {
+									historyIdx--
+								}
+								// Erase current line on screen
+								for lineBuf.Len() > 0 {
+									fmt.Print("\b \b")
+									p := lineBuf.Bytes()
+									lineBuf.Reset()
+									lineBuf.Write(p[:len(p)-1])
+								}
+								cmd := history[historyIdx]
+								lineBuf.WriteString(cmd)
+								fmt.Print(cmd)
+							}
+							continue
+						} else if b3 == 'B' { // Down Arrow -> Recall Next Command
+							if historyIdx >= 0 {
+								for lineBuf.Len() > 0 {
+									fmt.Print("\b \b")
+									p := lineBuf.Bytes()
+									lineBuf.Reset()
+									lineBuf.Write(p[:len(p)-1])
+								}
+								if historyIdx < len(history)-1 {
+									historyIdx++
+									cmd := history[historyIdx]
+									lineBuf.WriteString(cmd)
+									fmt.Print(cmd)
+								} else {
+									historyIdx = -1
+								}
+							}
+							continue
 						}
 					}
 				}
+				continue
 			}
+
+			// Handle Backspace (0x08 or 0x7F)
+			if b == 0x08 || b == 0x7F {
+				if lineBuf.Len() > 0 {
+					p := lineBuf.Bytes()
+					lineBuf.Reset()
+					lineBuf.Write(p[:len(p)-1])
+					fmt.Print("\b \b")
+				}
+				continue
+			}
+
+			// Handle Enter (\r or \n)
+			if b == '\r' || b == '\n' {
+				text := strings.TrimSpace(lineBuf.String())
+				lineBuf.Reset()
+				fmt.Print("\r\n")
+				if text != "" {
+					if len(history) == 0 || history[len(history)-1] != text {
+						history = append(history, text)
+					}
+					historyIdx = -1
+
+					processInputCmd(text, activePorts, logChan)
+				}
+				continue
+			}
+
+			// Instant passthrough for Control Characters:
+			// Ctrl+C (0x03), Ctrl+Z (0x1A), Ctrl+D (0x04), Ctrl+\ (0x1C), etc.
+			if b < 0x20 && b != '\t' {
+				ctrlByte := []byte{b}
+				count := 0
+				activePorts.Range(func(key, value any) bool {
+					if p, ok := value.(serial.Port); ok {
+						_, _ = p.Write(ctrlByte)
+						count++
+					}
+					return true
+				})
+				logChan <- LogMessage{
+					PortName:  "SYS",
+					Direction: "SYS",
+					ColorCode: "\033[1;35m",
+					Timestamp: time.Now(),
+					Content:   fmt.Sprintf("📢 [键盘物理按键 0x%02X] 已向 %d 个串口透传广播下发", b, count),
+				}
+				continue
+			}
+
+			// Regular printable character: buffer it and echo locally
+			lineBuf.WriteByte(b)
+			fmt.Printf("%c", b)
 		}
 	}
 }
 
-// Read stdin from interactive terminal for command broadcasting or targeted send
-func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		// ANSI: Move cursor up 1 line and clear it. This erases the raw local echo!
-		fmt.Print("\033[1A\033[2K")
-
-		text := strings.TrimSpace(scanner.Text())
-		if text == "" {
-			continue
+// Helper to parse text shorthands like "ctrl-c", "ctrl-z", "ctrl-d", "ctrl-\" into raw ASCII control bytes
+func parseCtrlCommand(cmdStr string) ([]byte, bool) {
+	s := strings.ToLower(strings.TrimSpace(cmdStr))
+	if strings.HasPrefix(s, "ctrl-") || strings.HasPrefix(s, "ctrl+") {
+		sub := s[5:]
+		if len(sub) == 1 {
+			ch := sub[0]
+			if (ch >= 'a' && ch <= 'z') || ch == '\\' || ch == '[' || ch == ']' || ch == '^' || ch == '_' {
+				return []byte{ch & 0x1F}, true
+			}
 		}
-
-		processInputCmd(text, activePorts, logChan)
 	}
+	return nil, false
 }
 
 func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessage) {
 	targetName, targetPort, cmdStr, isTargeted := parseTargetAndCommand(text, activePorts)
 
-	if isTargeted && targetName == "SYS" {
-		cmdLower := strings.ToLower(cmdStr)
-		if cmdLower == "help" || cmdLower == "?" {
-			printCommandHelp(logChan)
-		} else {
-			logChan <- LogMessage{
-				PortName:  "SYS",
-				Direction: "SYS",
-				ColorCode: "\033[1;31m",
-				Timestamp: time.Now(),
-				Content:   "❌ 未知的系统命令。支持: SYS: help",
-			}
-		}
-		return
-	}
+
 
 	var cmdBytes []byte
 	var err error
 
-	if hexMode {
+	if ctrlBytes, ok := parseCtrlCommand(cmdStr); ok {
+		cmdBytes = ctrlBytes
+	} else if hexMode {
 		// Remove spaces and parse hex
 		cleanHex := strings.ReplaceAll(cmdStr, " ", "")
 		cmdBytes, err = hex.DecodeString(cleanHex)
@@ -665,9 +900,6 @@ func parseTargetAndCommand(input string, activePorts *sync.Map) (targetName stri
 	}
 
 	if prefix != "" && cmd != "" {
-		if strings.ToUpper(prefix) == "SYS" {
-			return "SYS", nil, cmd, true
-		}
 		matchedName, matchedPort := matchActivePort(prefix, activePorts)
 		if matchedPort != nil {
 			return matchedName, matchedPort, cmd, true
@@ -738,8 +970,13 @@ func printCommandHelp(logChan chan<- LogMessage) {
 		"     - 端口别名格式: A1: reset       (向别名为 A1 的端口发送 reset)",
 		"  2. 全局广播 (无端口前缀):",
 		"     - 直接输入命令: reset           (向所有打开的串口广播发送 reset)",
-		"  3. 系统指令 (SYS 前缀):",
-		"     - 查看帮助: SYS: help",
+		"  3. 特殊控制信号指令 (支持 ctrl-a 到 ctrl-z, ctrl-\\ 等):",
+		"     - 示例: ctrl-c     (下发 0x03 ETX / 打断信号)",
+		"     - 示例: ctrl-z     (下发 0x1A SUB / 挂起信号)",
+		"     - 示例: ctrl-d     (下发 0x04 EOT / EOF 退出 Shell)",
+		"     - 示例: A1: ctrl-c (定向向别名为 A1 的串口下发 0x03)",
+		"  4. Logger 程序退出指令:",
+		"     - 按 Ctrl+[ (或输入 ctrl+[) 为 multi_uart_logger 唯一的退出指令",
 		"-----------------------------------------------------------------------",
 	}
 	
