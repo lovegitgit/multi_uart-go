@@ -843,8 +843,6 @@ func handleTelnetClient(conn net.Conn, user string, pass string, activePorts *sy
 		Content:   fmt.Sprintf("🔗 新的 Telnet 客户端连接成功: %s", conn.RemoteAddr()),
 	}
 
-	conn.Write([]byte("\033[1;32m欢迎进入多串口 Telnet 控制台！输入 help 查看帮助。\033[0m\r\n"))
-
 	for scanner.Scan() {
 		// ANSI: Move cursor up 1 line and clear it to erase the telnet client's local echo
 		conn.Write([]byte("\033[1A\033[2K"))
