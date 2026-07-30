@@ -503,9 +503,28 @@ func startPortPipeline(portName string, alias string, baudRate int, colorCode st
 // Read stdin byte-by-byte in RAW terminal mode for instant non-canonical keypress & hotkey handling
 func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 	buf := make([]byte, 1)
-	var lineBuf bytes.Buffer
+	// Keep the editable line separately from the cursor position.  A bytes.Buffer
+	// is sufficient for appending, but it cannot represent an insertion point,
+	// which is why the old implementation could only edit at the end of a line.
+	var input []rune
+	cursor := 0
 	var history []string
 	historyIdx := -1
+
+	moveCursorLeft := func(n int) {
+		if n > 0 {
+			fmt.Print(strings.Repeat("\033[D", n))
+		}
+	}
+
+	setInput := func(text string) {
+		// Clear the old line, draw the recalled line, and leave the cursor at
+		// its end. This also handles recalling a shorter history entry.
+		fmt.Print("\r\033[2K")
+		input = []rune(text)
+		cursor = len(input)
+		fmt.Print(string(input))
+	}
 
 	readLineBytes := func(timeout time.Duration) (byte, bool) {
 		ch := make(chan byte, 1)
@@ -577,34 +596,30 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 								} else if historyIdx > 0 {
 									historyIdx--
 								}
-								// Erase current line on screen
-								for lineBuf.Len() > 0 {
-									fmt.Print("\b \b")
-									p := lineBuf.Bytes()
-									lineBuf.Reset()
-									lineBuf.Write(p[:len(p)-1])
-								}
-								cmd := history[historyIdx]
-								lineBuf.WriteString(cmd)
-								fmt.Print(cmd)
+								setInput(history[historyIdx])
 							}
 							continue
 						} else if b3 == 'B' { // Down Arrow -> Recall Next Command
 							if historyIdx >= 0 {
-								for lineBuf.Len() > 0 {
-									fmt.Print("\b \b")
-									p := lineBuf.Bytes()
-									lineBuf.Reset()
-									lineBuf.Write(p[:len(p)-1])
-								}
 								if historyIdx < len(history)-1 {
 									historyIdx++
-									cmd := history[historyIdx]
-									lineBuf.WriteString(cmd)
-									fmt.Print(cmd)
+									setInput(history[historyIdx])
 								} else {
 									historyIdx = -1
+									setInput("")
 								}
+							}
+							continue
+						} else if b3 == 'D' { // Left Arrow
+							if cursor > 0 {
+								cursor--
+								moveCursorLeft(1)
+							}
+							continue
+						} else if b3 == 'C' { // Right Arrow
+							if cursor < len(input) {
+								fmt.Print("\033[C")
+								cursor++
 							}
 							continue
 						}
@@ -615,19 +630,29 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 
 			// Handle Backspace (0x08 or 0x7F)
 			if b == 0x08 || b == 0x7F {
-				if lineBuf.Len() > 0 {
-					p := lineBuf.Bytes()
-					lineBuf.Reset()
-					lineBuf.Write(p[:len(p)-1])
-					fmt.Print("\b \b")
+				if cursor > 0 {
+					if cursor == len(input) {
+						// The common case: preserve the traditional backspace
+						// sequence, which works on terminals with limited ANSI support.
+						fmt.Print("\b \b")
+						input = input[:cursor-1]
+						cursor--
+					} else {
+						// When deleting in the middle, redraw the shifted suffix.
+						input = append(input[:cursor-1], input[cursor:]...)
+						cursor--
+						fmt.Print(string(input[cursor:]), " ")
+						moveCursorLeft(len(input) - cursor + 1)
+					}
 				}
 				continue
 			}
 
 			// Handle Enter (\r or \n)
 			if b == '\r' || b == '\n' {
-				text := strings.TrimSpace(lineBuf.String())
-				lineBuf.Reset()
+				text := strings.TrimSpace(string(input))
+				input = nil
+				cursor = 0
 				fmt.Print("\r\n")
 				if text != "" {
 					if len(history) == 0 || history[len(history)-1] != text {
@@ -663,8 +688,14 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 			}
 
 			// Regular printable character: buffer it and echo locally
-			lineBuf.WriteByte(b)
-			fmt.Printf("%c", b)
+			if b >= 0x20 {
+				input = append(input, 0)
+				copy(input[cursor+1:], input[cursor:])
+				input[cursor] = rune(b)
+				cursor++
+				fmt.Printf("%c", b)
+				moveCursorLeft(len(input) - cursor)
+			}
 		}
 	}
 }
