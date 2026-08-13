@@ -168,7 +168,7 @@ func main() {
 	// Prepare Log File writer if requested
 	var logFileWriter *os.File
 	if logFile != "" {
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 		if err != nil {
 			log.Fatalf("❌ 无法创建/打开日志文件 %s: %v", logFile, err)
 		}
