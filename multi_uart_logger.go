@@ -71,13 +71,10 @@ func (m *MultiPortFlag) Set(value string) error {
 }
 
 func main() {
-	if st, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
-		origTerminalState = st
-		defer term.Restore(int(os.Stdin.Fd()), st)
-	}
 	var portFlags MultiPortFlag
 	var logFile string
 	var listenAddr string
+	var listPorts bool
 	var telnetUser string
 	var telnetPass string
 	var showFullDate bool
@@ -88,8 +85,10 @@ func main() {
 	flag.Var(&portFlags, "port", "同 -p")
 	flag.StringVar(&logFile, "o", "", "指定可选的输出保存日志文件名 (例如: -o serial_all.log)")
 	flag.StringVar(&logFile, "out", "", "同 -o")
-	flag.StringVar(&listenAddr, "l", "", "启动 Telnet 转发服务，格式: ip:port (例如: -l 0.0.0.0:8023)")
-	flag.StringVar(&listenAddr, "listen", "", "同 -l")
+	flag.BoolVar(&listPorts, "l", false, "列出当前系统所有可用串口并退出")
+	flag.BoolVar(&listPorts, "list", false, "同 -l")
+	flag.StringVar(&listenAddr, "L", "", "启动 Telnet 转发服务，格式: ip:port (例如: -L 0.0.0.0:8023)")
+	flag.StringVar(&listenAddr, "listen", "", "同 -L")
 	flag.StringVar(&telnetUser, "user", "", "Telnet 服务用户名 (如果不设置则无密码)")
 	flag.StringVar(&telnetPass, "pass", "", "Telnet 服务密码")
 	flag.BoolVar(&showFullDate, "full-date", false, "时间戳是否显示完整年份 (默认显示月-日)")
@@ -103,11 +102,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, " 🚀 高性能多串口实时日志汇总监控工具 (Multi-UART Logger)              \n")
 		fmt.Fprintf(os.Stderr, "=======================================================================\n")
 		fmt.Fprintf(os.Stderr, "用法:\n")
+		fmt.Fprintf(os.Stderr, "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM23,115200 -p COM24,115200\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 -l 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 --listen 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "参数说明:\n")
 		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx,Baud[,Alias] (如: -p COM25,115200,A1)\n")
-		fmt.Fprintf(os.Stderr, "  -l, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: -l 0.0.0.0:8023)\n")
+		fmt.Fprintf(os.Stderr, "  -l, --list\n\t列出当前系统所有可用串口并退出\n")
+		fmt.Fprintf(os.Stderr, "  -L, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: --listen 0.0.0.0:8023)\n")
 		fmt.Fprintf(os.Stderr, "  -o, --out string\n\t指定可选的输出保存日志文件名 (如: -o serial_log.txt)\n")
 		fmt.Fprintf(os.Stderr, "  -b, --baud int\n\t为未指定波特率的串口提供默认波特率 (默认 115200)\n")
 		fmt.Fprintf(os.Stderr, "  --user string\n\tTelnet 服务认证用户名 (不设置则无密码)\n")
@@ -121,13 +122,15 @@ func main() {
 
 	// Handle extra non-flag positional arguments as port configs (e.g. -p COM23,115200 COM24,115200)
 	rawPortConfigs := []string(portFlags)
-	
+
 	// Golang's flag package stops parsing at the first non-flag argument.
-	// We manually scan the remaining args to rescue incorrectly placed flags like -l or -o.
+	// We manually scan the remaining args to rescue flags placed after a positional port.
 	args := flag.Args()
 	var positionalPorts []string
 	for i := 0; i < len(args); i++ {
-		if (args[i] == "-l" || args[i] == "--listen" || args[i] == "-listen") && i+1 < len(args) {
+		if args[i] == "-l" || args[i] == "--list" || args[i] == "-list" {
+			listPorts = true
+		} else if (args[i] == "-L" || args[i] == "--listen" || args[i] == "-listen") && i+1 < len(args) {
 			listenAddr = args[i+1]
 			i++
 		} else if (args[i] == "--user" || args[i] == "-user") && i+1 < len(args) {
@@ -156,6 +159,11 @@ func main() {
 	}
 	rawPortConfigs = append(rawPortConfigs, positionalPorts...)
 
+	if listPorts {
+		listAvailablePorts()
+		return
+	}
+
 	configs := parseSerialConfigs(rawPortConfigs, defaultBaud)
 
 	if len(configs) == 0 {
@@ -163,6 +171,11 @@ func main() {
 		listAvailablePorts()
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if st, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
+		origTerminalState = st
+		defer term.Restore(int(os.Stdin.Fd()), st)
 	}
 
 	// Prepare Log File writer if requested
@@ -780,7 +793,7 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 			}
 			return true
 		})
-		
+
 		logChan <- LogMessage{
 			PortName:  "SYS",
 			Direction: "SYS",
@@ -1008,7 +1021,7 @@ func printCommandHelp(logChan chan<- LogMessage) {
 		"     - 按 Ctrl+[ (或输入 ctrl+[) 为 multi_uart_logger 唯一的退出指令",
 		"-----------------------------------------------------------------------",
 	}
-	
+
 	now := time.Now()
 	for _, line := range lines {
 		logChan <- LogMessage{

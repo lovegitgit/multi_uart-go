@@ -25,6 +25,9 @@ Multi-UART Logger 是一款使用 Go 语言开发的轻量级、跨平台、高�
 你可以通过命令行传入一个或多个串口配置，形如 `-p 串口名称,波特率,别名`。
 
 ```bash
+# 列出当前系统中所有可用串口
+./multi_uart_logger --list
+
 # 基本用法：同时监听两个串口，波特率均为 115200
 ./multi_uart_logger -p COM23,115200 -p COM24,115200
 
@@ -41,7 +44,8 @@ Multi-UART Logger 是一款使用 Go 语言开发的轻量级、跨平台、高�
 ### 命令说明
 你可以使用 `help` 或 `--help` 随时查看所有命令行参数：
 * `-p` 或 `--port` : 串口配置参数，格式为 `COMx,Baud,Alias` 或 `/dev/ttyUSB0,115200,A1`
-* `-l` 或 `--listen`: 启动 Telnet 监听服务的 `IP:Port` 
+* `-l` 或 `--list` : 列出当前系统中所有可用串口并退出
+* `-L` 或 `--listen`: 启动 Telnet 监听服务的 `IP:Port`
 * `--user` : Telnet 登录认证用户名 (留空则无密码)
 * `--pass` : Telnet 登录认证密码
 * `--hex` : 启用全包聚合后的 16 进制收发模式
