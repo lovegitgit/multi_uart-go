@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type SerialConfig struct {
 	BaudRate int
 	Alias    string
 	HexMode  bool
+	EOL      string
 }
 
 var (
@@ -47,6 +49,8 @@ var (
 	telnetClients      = make(map[net.Conn]bool)
 	hexMode            bool
 	portHexModes       sync.Map // lower(port/alias) -> bool
+	globalEOL          = "\r\n"
+	portEOLModes       sync.Map // lower(port/alias) -> string
 
 	origTerminalState *term.State
 )
@@ -56,6 +60,43 @@ func isPortHexMode(name string) bool {
 		return v.(bool)
 	}
 	return hexMode
+}
+
+func getPortEOL(name string) string {
+	if v, ok := portEOLModes.Load(strings.ToLower(name)); ok {
+		return v.(string)
+	}
+	return globalEOL
+}
+
+func parseEOL(s string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "crlf", "\\r\\n", "\r\n":
+		return "\r\n", true
+	case "lf", "\\n", "\n":
+		return "\n", true
+	case "cr", "\\r", "\r":
+		return "\r", true
+	case "none", "null", "empty", "no", "0":
+		return "", true
+	default:
+		return "", false
+	}
+}
+
+func formatEOLDesc(eol string) string {
+	switch eol {
+	case "\r\n":
+		return "CRLF (\\r\\n)"
+	case "\n":
+		return "LF (\\n)"
+	case "\r":
+		return "CR (\\r)"
+	case "":
+		return "NONE (无)"
+	default:
+		return fmt.Sprintf("%q", eol)
+	}
 }
 
 // LogMessage represents a framed log line from a specific port
@@ -81,7 +122,6 @@ func (m *MultiPortFlag) Set(value string) error {
 
 func main() {
 	var portFlags MultiPortFlag
-	var modeFlags MultiPortFlag
 	var logFile string
 	var listenAddr string
 	var listPorts bool
@@ -90,11 +130,10 @@ func main() {
 	var showFullDate bool
 	var timeOnly bool
 	var defaultBaud int
+	var eolFlag string
 
-	flag.Var(&portFlags, "p", "串口配置 (单字母用 -p, 多字母可用 --port) 格式: COMx,Baud[,Alias[,Mode]] (如: -p COM25,115200,A1,hex)")
+	flag.Var(&portFlags, "p", "串口配置 (单字母用 -p, 多字母可用 --port) 格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或留空覆盖: -p COM5,,,,cr)")
 	flag.Var(&portFlags, "port", "同 -p")
-	flag.Var(&modeFlags, "m", "单独设定或覆盖串口模式，格式: COMx,hex 或 COMx,text (可多次指定或逗号/空格分隔)")
-	flag.Var(&modeFlags, "mode", "同 -m")
 	flag.StringVar(&logFile, "o", "", "指定可选的输出保存日志文件名 (例如: -o serial_all.log)")
 	flag.StringVar(&logFile, "out", "", "同 -o")
 	flag.BoolVar(&listPorts, "l", false, "列出当前系统所有可用串口并退出")
@@ -108,6 +147,7 @@ func main() {
 	flag.IntVar(&defaultBaud, "b", 115200, "未指定波特率时的默认波特率")
 	flag.IntVar(&defaultBaud, "baud", 115200, "同 -b")
 	flag.BoolVar(&hexMode, "hex", false, "启用全局默认 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)")
+	flag.StringVar(&eolFlag, "eol", "crlf", "全局文本模式发送行尾换行符: crlf (默认), lf, cr, none")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "=======================================================================\n")
@@ -116,11 +156,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM23,115200 -p COM24,115200\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -m COM3,text\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -p COM3,,,text\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM5,,,,cr -p COM6,115200,,text,lf --eol crlf\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 --listen 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "参数说明:\n")
-		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx,Baud[,Alias[,Mode]] (如: -p COM25,115200,A1,hex)\n")
-		fmt.Fprintf(os.Stderr, "  -m, --mode string\n\t单独设定或覆盖串口模式，格式: COMx,hex 或 COMx,text (支持逗号/等号/冒号分隔)\n")
+		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或留空覆盖: -p COM5,,,,cr)\n")
+		fmt.Fprintf(os.Stderr, "  --eol string\n\t全局文本模式发送行尾换行符: crlf (默认), lf, cr, none\n")
 		fmt.Fprintf(os.Stderr, "  -l, --list\n\t列出当前系统所有可用串口并退出\n")
 		fmt.Fprintf(os.Stderr, "  -L, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: --listen 0.0.0.0:8023)\n")
 		fmt.Fprintf(os.Stderr, "  -o, --out string\n\t指定可选的输出保存日志文件名 (如: -o serial_log.txt)\n")
@@ -136,7 +177,6 @@ func main() {
 
 	// Handle extra non-flag positional arguments as port configs (e.g. -p COM23,115200 COM24,115200)
 	rawPortConfigs := []string(portFlags)
-	rawModeConfigs := []string(modeFlags)
 
 	// Golang's flag package stops parsing at the first non-flag argument.
 	// We manually scan the remaining args to rescue flags placed after a positional port.
@@ -163,20 +203,14 @@ func main() {
 			timeOnly = true
 		} else if args[i] == "--hex" || args[i] == "-hex" {
 			hexMode = true
-		} else if (args[i] == "-m" || args[i] == "--mode" || args[i] == "-mode") && i+1 < len(args) {
-			rawModeConfigs = append(rawModeConfigs, args[i+1])
+		} else if (args[i] == "--eol" || args[i] == "-eol") && i+1 < len(args) {
+			eolFlag = args[i+1]
 			i++
-			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && isModeConfig(args[i+1]) {
-				rawModeConfigs = append(rawModeConfigs, args[i+1])
-				i++
-			}
 		} else if (args[i] == "-b" || args[i] == "--baud" || args[i] == "-baud") && i+1 < len(args) {
 			if b, err := strconv.Atoi(args[i+1]); err == nil {
 				defaultBaud = b
 			}
 			i++
-		} else if isModeConfig(args[i]) {
-			rawModeConfigs = append(rawModeConfigs, args[i])
 		} else {
 			positionalPorts = append(positionalPorts, args[i])
 		}
@@ -188,22 +222,17 @@ func main() {
 		return
 	}
 
-	configs := parseSerialConfigs(rawPortConfigs, defaultBaud, hexMode)
-
-	// Apply mode overrides from -m / --mode
-	modeOverrides := parseModeOverrides(rawModeConfigs)
-	for i := range configs {
-		if mode, ok := modeOverrides[strings.ToLower(configs[i].Port)]; ok {
-			configs[i].HexMode = mode
-		}
-		if mode, ok := modeOverrides[strings.ToLower(configs[i].Alias)]; ok {
-			configs[i].HexMode = mode
-		}
+	if parsedEOL, ok := parseEOL(eolFlag); ok {
+		globalEOL = parsedEOL
 	}
+
+	configs := parseSerialConfigs(rawPortConfigs, defaultBaud, hexMode, globalEOL)
 
 	for _, cfg := range configs {
 		portHexModes.Store(strings.ToLower(cfg.Port), cfg.HexMode)
 		portHexModes.Store(strings.ToLower(cfg.Alias), cfg.HexMode)
+		portEOLModes.Store(strings.ToLower(cfg.Port), cfg.EOL)
+		portEOLModes.Store(strings.ToLower(cfg.Alias), cfg.EOL)
 	}
 
 	if len(configs) == 0 {
@@ -242,12 +271,12 @@ func main() {
 		if cfg.HexMode {
 			modeTag = "\033[1;33m[HEX]\033[0m"
 		}
-		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate, modeTag)
+		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s | EOL: %s\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate, modeTag, formatEOLDesc(cfg.EOL))
 	}
 	fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
+	fmt.Printf(" 💡 [发送换行符] 全局默认: %s (可用 --eol 设置全局, 或 -p COMx,,,,<eol> 单独覆盖)\n", formatEOLDesc(globalEOL))
 	fmt.Printf(" 💡 [交互模式] 终端输入命令按回车可广播; 输入 Alias: cmd 或 COMx: cmd 可定向发送\n")
-	fmt.Printf(" 💡 [交互模式] 终端所有输入 (含 exit, help, ctrl-c) 均百分百透传下发给串口\n")
-	fmt.Printf(" 💡 [退出程序] 按 Ctrl+[ (或输入 ctrl+[) 为 multi_uart_logger 唯一的退出指令\n")
+	fmt.Printf(" 💡 [退出程序] 按 Ctrl+] 退出 multi_uart_logger\n")
 	fmt.Printf("=======================================================================\n\n")
 
 	logChan := make(chan LogMessage, 10000)
@@ -361,51 +390,10 @@ func main() {
 	}
 }
 
-// Helper to detect if an argument token is specifying a mode like "hex", "text", "com3,text", "com4=hex", etc.
-func isModeConfig(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	for _, sep := range []string{",", "=", ":"} {
-		if idx := strings.Index(s, sep); idx > 0 {
-			mode := strings.TrimSpace(s[idx+1:])
-			if mode == "hex" || mode == "raw" || mode == "text" || mode == "ascii" || mode == "str" {
-				return true
-			}
-		}
-	}
-	return s == "hex" || s == "raw" || s == "text" || s == "ascii" || s == "str"
-}
 
-// parseModeOverrides parses entries like "com3,text", "com4=hex", "MCU:text"
-func parseModeOverrides(rawModes []string) map[string]bool {
-	overrides := make(map[string]bool)
-	for _, raw := range rawModes {
-		fields := strings.Fields(raw)
-		for _, f := range fields {
-			f = strings.TrimSpace(f)
-			if f == "" {
-				continue
-			}
-			var name, modeStr string
-			if idx := strings.IndexAny(f, ",=:"); idx > 0 {
-				name = strings.TrimSpace(f[:idx])
-				modeStr = strings.TrimSpace(f[idx+1:])
-			} else {
-				continue
-			}
 
-			modeStrLower := strings.ToLower(modeStr)
-			if modeStrLower == "hex" || modeStrLower == "raw" {
-				overrides[strings.ToLower(name)] = true
-			} else if modeStrLower == "text" || modeStrLower == "ascii" || modeStrLower == "str" {
-				overrides[strings.ToLower(name)] = false
-			}
-		}
-	}
-	return overrides
-}
-
-// Parse input arguments like ["COM23,115200", "COM24,115200", "COM25,921600,A1,hex"]
-func parseSerialConfigs(args []string, defaultBaud int, globalHex bool) []SerialConfig {
+// Parse input arguments like ["COM23,115200", "COM24,115200", "COM25,921600,A1,hex", "COM5,,,,cr"]
+func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultEOL string) []SerialConfig {
 	var results []SerialConfig
 	seen := make(map[string]bool)
 
@@ -429,21 +417,73 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool) []Serial
 		baud := defaultBaud
 		alias := port
 		isHex := globalHex
+		eol := defaultEOL
 
-		for _, part := range parts[1:] {
+		for idx, part := range parts[1:] {
 			p := strings.TrimSpace(part)
 			if p == "" {
-				continue
+				continue // empty slot: preserve default/inherited value
 			}
 			pLower := strings.ToLower(p)
-			if pLower == "hex" || pLower == "raw" {
-				isHex = true
-			} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
-				isHex = false
-			} else if b, err := strconv.Atoi(p); err == nil && b > 0 {
-				baud = b
-			} else {
-				alias = p
+			pos := idx + 1 // 1: baud, 2: alias, 3: mode, 4: eol
+
+			switch pos {
+			case 1:
+				if b, err := strconv.Atoi(p); err == nil && b > 0 {
+					baud = b
+				} else if pLower == "hex" || pLower == "raw" {
+					isHex = true
+				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
+					isHex = false
+				} else if parsedEOL, ok := parseEOL(pLower); ok {
+					eol = parsedEOL
+				} else {
+					alias = p
+				}
+			case 2:
+				if b, err := strconv.Atoi(p); err == nil && b > 0 {
+					baud = b
+				} else if pLower == "hex" || pLower == "raw" {
+					isHex = true
+				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
+					isHex = false
+				} else if parsedEOL, ok := parseEOL(pLower); ok {
+					eol = parsedEOL
+				} else {
+					alias = p
+				}
+			case 3:
+				if pLower == "hex" || pLower == "raw" {
+					isHex = true
+				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
+					isHex = false
+				} else if parsedEOL, ok := parseEOL(pLower); ok {
+					eol = parsedEOL
+				} else if b, err := strconv.Atoi(p); err == nil && b > 0 {
+					baud = b
+				} else {
+					alias = p
+				}
+			case 4:
+				if parsedEOL, ok := parseEOL(pLower); ok {
+					eol = parsedEOL
+				} else if pLower == "hex" || pLower == "raw" {
+					isHex = true
+				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
+					isHex = false
+				} else if b, err := strconv.Atoi(p); err == nil && b > 0 {
+					baud = b
+				} else {
+					alias = p
+				}
+			default:
+				if parsedEOL, ok := parseEOL(pLower); ok {
+					eol = parsedEOL
+				} else if pLower == "hex" || pLower == "raw" {
+					isHex = true
+				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
+					isHex = false
+				}
 			}
 		}
 
@@ -454,6 +494,7 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool) []Serial
 				BaudRate: baud,
 				Alias:    alias,
 				HexMode:  isHex,
+				EOL:      eol,
 			})
 		}
 	}
@@ -680,23 +721,12 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 				os.Exit(0)
 			}
 
-			// Handle ESC (0x1B / Ctrl+[) vs ANSI Escape Sequences (Arrow Keys)
+			// Handle ESC (0x1B) vs ANSI Escape Sequences (Arrow Keys, Delete, Home, End)
 			if b == 0x1B {
 				b2, ok2 := readLineBytes(10 * time.Millisecond)
 				if !ok2 {
-					// Standalone ESC / Ctrl+[ -> Exit program!
-					if origTerminalState != nil {
-						_ = term.Restore(int(os.Stdin.Fd()), origTerminalState)
-					}
-					logChan <- LogMessage{
-						PortName:  "SYS",
-						Direction: "SYS",
-						ColorCode: "\033[1;33m",
-						Timestamp: time.Now(),
-						Content:   "👋 捕获到 Ctrl+[ (ESC) 退出快捷键，正在退出 multi_uart_logger...",
-					}
-					time.Sleep(100 * time.Millisecond)
-					os.Exit(0)
+					// Standalone ESC: do not exit, simply ignore to prevent accidental exits
+					continue
 				}
 
 				if b2 == '[' || b2 == 'O' {
@@ -875,7 +905,8 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 					return
 				}
 			} else {
-				cmdBytes = []byte(cmdStr + "\r\n")
+				eol := getPortEOL(targetName)
+				cmdBytes = []byte(cmdStr + eol)
 			}
 		}
 
@@ -905,7 +936,6 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 		if b, e := hex.DecodeString(cleanHex); e == nil && len(b) > 0 {
 			hexBytes = b
 		}
-		textBytes := []byte(cmdStr + "\r\n")
 
 		activePorts.Range(func(key, value any) bool {
 			if p, ok := value.(serial.Port); ok {
@@ -921,7 +951,8 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 						return true
 					}
 				} else {
-					sendData = textBytes
+					eol := getPortEOL(portName)
+					sendData = []byte(cmdStr + eol)
 				}
 
 				if len(sendData) > 0 {
@@ -1163,7 +1194,7 @@ func printCommandHelp(logChan chan<- LogMessage) {
 		"     - 示例: ctrl-d     (下发 0x04 EOT / EOF 退出 Shell)",
 		"     - 示例: A1: ctrl-c (定向向别名为 A1 的串口下发 0x03)",
 		"  4. Logger 程序退出指令:",
-		"     - 按 Ctrl+[ (或输入 ctrl+[) 为 multi_uart_logger 唯一的退出指令",
+		"     - 按 Ctrl+] 退出 multi_uart_logger",
 		"-----------------------------------------------------------------------",
 	}
 
@@ -1179,12 +1210,42 @@ func printCommandHelp(logChan chan<- LogMessage) {
 	}
 }
 
+func extractPortNum(s string) int {
+	sUpper := strings.ToUpper(strings.TrimSpace(s))
+	if strings.HasPrefix(sUpper, "COM") {
+		if n, err := strconv.Atoi(sUpper[3:]); err == nil {
+			return n
+		}
+	}
+	// Extract trailing digits if any (e.g. /dev/ttyUSB0)
+	idx := len(s)
+	for idx > 0 && s[idx-1] >= '0' && s[idx-1] <= '9' {
+		idx--
+	}
+	if idx < len(s) {
+		if n, err := strconv.Atoi(s[idx:]); err == nil {
+			return n
+		}
+	}
+	return 999999
+}
+
 func listAvailablePorts() {
 	ports, err := serial.GetPortsList()
 	if err != nil || len(ports) == 0 {
 		fmt.Println("ℹ️ 未找到任何可用的串口!")
 		return
 	}
+
+	sort.Slice(ports, func(i, j int) bool {
+		n1 := extractPortNum(ports[i])
+		n2 := extractPortNum(ports[j])
+		if n1 != n2 {
+			return n1 < n2
+		}
+		return ports[i] < ports[j]
+	})
+
 	fmt.Println("🔍 当前可用串口列表:")
 	for _, p := range ports {
 		fmt.Printf("   - %s\n", p)
