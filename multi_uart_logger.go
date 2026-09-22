@@ -882,6 +882,32 @@ func parseCtrlCommand(cmdStr string) ([]byte, bool) {
 	return nil, false
 }
 
+// parseHexInput parses user hex input string, supporting space-separated tokens with single-digit padding (e.g. "01 C 0 0" -> 01 0c 00 00)
+func parseHexInput(s string) ([]byte, error) {
+	fields := strings.Fields(s)
+	if len(fields) > 1 {
+		var sb strings.Builder
+		for _, f := range fields {
+			if len(f) == 1 {
+				sb.WriteByte('0')
+				sb.WriteString(f)
+			} else {
+				sb.WriteString(f)
+			}
+		}
+		clean := sb.String()
+		if len(clean)%2 != 0 {
+			return nil, fmt.Errorf("hex string has odd length (%d chars)", len(clean))
+		}
+		return hex.DecodeString(clean)
+	}
+	clean := strings.ReplaceAll(s, " ", "")
+	if len(clean)%2 != 0 {
+		return nil, fmt.Errorf("hex string has odd length (%d chars)", len(clean))
+	}
+	return hex.DecodeString(clean)
+}
+
 func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessage) {
 	targetName, targetPort, cmdStr, isTargeted := parseTargetAndCommand(text, activePorts)
 
@@ -895,16 +921,14 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 	if isTargeted {
 		if cmdBytes == nil {
 			if isPortHexMode(targetName) {
-				// Remove spaces and parse hex
-				cleanHex := strings.ReplaceAll(cmdStr, " ", "")
-				cmdBytes, err = hex.DecodeString(cleanHex)
+				cmdBytes, err = parseHexInput(cmdStr)
 				if err != nil {
 					logChan <- LogMessage{
 						PortName:  "SYS",
 						Direction: "SYS",
 						ColorCode: "\033[1;31m", // Red
 						Timestamp: time.Now(),
-						Content:   fmt.Sprintf("❌ Hex 格式错误，忽略发送 -> %s: %s", targetName, cmdStr),
+						Content:   fmt.Sprintf("❌ Hex 格式错误，忽略发送 -> %s: %s (%v)", targetName, cmdStr, err),
 					}
 					return
 				}
@@ -934,13 +958,51 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 		}
 	} else {
 		// Broadcast command to all active ports
-		count := 0
-		var hexBytes []byte
-		cleanHex := strings.ReplaceAll(cmdStr, " ", "")
-		if b, e := hex.DecodeString(cleanHex); e == nil && len(b) > 0 {
-			hexBytes = b
+		totalActive := 0
+		hexPortCount := 0
+		textPortCount := 0
+		activePorts.Range(func(key, value any) bool {
+			if _, ok := value.(serial.Port); ok {
+				totalActive++
+				portName := key.(string)
+				if isPortHexMode(portName) {
+					hexPortCount++
+				} else {
+					textPortCount++
+				}
+			}
+			return true
+		})
+
+		if totalActive == 0 {
+			logChan <- LogMessage{
+				PortName:  "SYS",
+				Direction: "SYS",
+				ColorCode: "\033[1;33m",
+				Timestamp: time.Now(),
+				Content:   fmt.Sprintf("⚠️ 当前无可用已连接串口，命令未发送: %s", cmdStr),
+			}
+			return
 		}
 
+		var hexBytes []byte
+		var hexErr error
+		if hexPortCount > 0 && cmdBytes == nil {
+			hexBytes, hexErr = parseHexInput(cmdStr)
+			if hexErr != nil && textPortCount == 0 {
+				// All active ports are in Hex mode, but input is not valid hex!
+				logChan <- LogMessage{
+					PortName:  "SYS",
+					Direction: "SYS",
+					ColorCode: "\033[1;31m", // Red
+					Timestamp: time.Now(),
+					Content:   fmt.Sprintf("❌ Hex 格式错误，未向串口发送: %s (%v)", cmdStr, hexErr),
+				}
+				return
+			}
+		}
+
+		count := 0
 		activePorts.Range(func(key, value any) bool {
 			if p, ok := value.(serial.Port); ok {
 				portName := key.(string)
@@ -951,7 +1013,7 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 					if hexBytes != nil {
 						sendData = hexBytes
 					} else {
-						// Content is not valid hex, skip sending to hex-only port
+						// Content is not valid hex, skip sending to this hex-only port
 						return true
 					}
 				} else {
@@ -981,14 +1043,6 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 				ColorCode: "\033[1;37m",
 				Timestamp: time.Now(),
 				Content:   fmt.Sprintf("📢 [广播命令 -> %d 个串口]: %s", count, cmdStr),
-			}
-		} else if count == 0 {
-			logChan <- LogMessage{
-				PortName:  "SYS",
-				Direction: "SYS",
-				ColorCode: "\033[1;33m",
-				Timestamp: time.Now(),
-				Content:   fmt.Sprintf("⚠️ 当前无可用已连接串口，命令未发送: %s", cmdStr),
 			}
 		}
 	}
