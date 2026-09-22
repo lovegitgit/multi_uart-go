@@ -39,15 +39,24 @@ type SerialConfig struct {
 	Port     string
 	BaudRate int
 	Alias    string
+	HexMode  bool
 }
 
 var (
 	telnetClientsMutex sync.Mutex
 	telnetClients      = make(map[net.Conn]bool)
 	hexMode            bool
+	portHexModes       sync.Map // lower(port/alias) -> bool
 
 	origTerminalState *term.State
 )
+
+func isPortHexMode(name string) bool {
+	if v, ok := portHexModes.Load(strings.ToLower(name)); ok {
+		return v.(bool)
+	}
+	return hexMode
+}
 
 // LogMessage represents a framed log line from a specific port
 type LogMessage struct {
@@ -72,6 +81,7 @@ func (m *MultiPortFlag) Set(value string) error {
 
 func main() {
 	var portFlags MultiPortFlag
+	var modeFlags MultiPortFlag
 	var logFile string
 	var listenAddr string
 	var listPorts bool
@@ -81,8 +91,10 @@ func main() {
 	var timeOnly bool
 	var defaultBaud int
 
-	flag.Var(&portFlags, "p", "串口配置 (单字母用 -p, 多字母可用 --port) 格式: COMx,Baud[,Alias] (如: -p COM25,115200,A1)")
+	flag.Var(&portFlags, "p", "串口配置 (单字母用 -p, 多字母可用 --port) 格式: COMx,Baud[,Alias[,Mode]] (如: -p COM25,115200,A1,hex)")
 	flag.Var(&portFlags, "port", "同 -p")
+	flag.Var(&modeFlags, "m", "单独设定或覆盖串口模式，格式: COMx,hex 或 COMx,text (可多次指定或逗号/空格分隔)")
+	flag.Var(&modeFlags, "mode", "同 -m")
 	flag.StringVar(&logFile, "o", "", "指定可选的输出保存日志文件名 (例如: -o serial_all.log)")
 	flag.StringVar(&logFile, "out", "", "同 -o")
 	flag.BoolVar(&listPorts, "l", false, "列出当前系统所有可用串口并退出")
@@ -95,7 +107,7 @@ func main() {
 	flag.BoolVar(&timeOnly, "time-only", false, "时间戳仅显示时分秒微秒 (格式: HH:MM:SS.uuuuuu)")
 	flag.IntVar(&defaultBaud, "b", 115200, "未指定波特率时的默认波特率")
 	flag.IntVar(&defaultBaud, "baud", 115200, "同 -b")
-	flag.BoolVar(&hexMode, "hex", false, "启用 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)")
+	flag.BoolVar(&hexMode, "hex", false, "启用全局默认 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "=======================================================================\n")
@@ -104,16 +116,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM23,115200 -p COM24,115200\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -m COM3,text\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 --listen 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "参数说明:\n")
-		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx,Baud[,Alias] (如: -p COM25,115200,A1)\n")
+		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx,Baud[,Alias[,Mode]] (如: -p COM25,115200,A1,hex)\n")
+		fmt.Fprintf(os.Stderr, "  -m, --mode string\n\t单独设定或覆盖串口模式，格式: COMx,hex 或 COMx,text (支持逗号/等号/冒号分隔)\n")
 		fmt.Fprintf(os.Stderr, "  -l, --list\n\t列出当前系统所有可用串口并退出\n")
 		fmt.Fprintf(os.Stderr, "  -L, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: --listen 0.0.0.0:8023)\n")
 		fmt.Fprintf(os.Stderr, "  -o, --out string\n\t指定可选的输出保存日志文件名 (如: -o serial_log.txt)\n")
 		fmt.Fprintf(os.Stderr, "  -b, --baud int\n\t为未指定波特率的串口提供默认波特率 (默认 115200)\n")
 		fmt.Fprintf(os.Stderr, "  --user string\n\tTelnet 服务认证用户名 (不设置则无密码)\n")
 		fmt.Fprintf(os.Stderr, "  --pass string\n\tTelnet 服务认证密码\n")
-		fmt.Fprintf(os.Stderr, "  --hex\n\t启用 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)\n")
+		fmt.Fprintf(os.Stderr, "  --hex\n\t启用全局默认 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)\n")
 		fmt.Fprintf(os.Stderr, "  --full-date\n\t时间戳是否显示完整年份 (默认仅显示月-日)\n")
 		fmt.Fprintf(os.Stderr, "  --time-only\n\t时间戳仅显示时分秒和毫秒 (格式: 15:04:05.000)\n")
 	}
@@ -122,6 +136,7 @@ func main() {
 
 	// Handle extra non-flag positional arguments as port configs (e.g. -p COM23,115200 COM24,115200)
 	rawPortConfigs := []string(portFlags)
+	rawModeConfigs := []string(modeFlags)
 
 	// Golang's flag package stops parsing at the first non-flag argument.
 	// We manually scan the remaining args to rescue flags placed after a positional port.
@@ -148,11 +163,20 @@ func main() {
 			timeOnly = true
 		} else if args[i] == "--hex" || args[i] == "-hex" {
 			hexMode = true
+		} else if (args[i] == "-m" || args[i] == "--mode" || args[i] == "-mode") && i+1 < len(args) {
+			rawModeConfigs = append(rawModeConfigs, args[i+1])
+			i++
+			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && isModeConfig(args[i+1]) {
+				rawModeConfigs = append(rawModeConfigs, args[i+1])
+				i++
+			}
 		} else if (args[i] == "-b" || args[i] == "--baud" || args[i] == "-baud") && i+1 < len(args) {
 			if b, err := strconv.Atoi(args[i+1]); err == nil {
 				defaultBaud = b
 			}
 			i++
+		} else if isModeConfig(args[i]) {
+			rawModeConfigs = append(rawModeConfigs, args[i])
 		} else {
 			positionalPorts = append(positionalPorts, args[i])
 		}
@@ -164,7 +188,23 @@ func main() {
 		return
 	}
 
-	configs := parseSerialConfigs(rawPortConfigs, defaultBaud)
+	configs := parseSerialConfigs(rawPortConfigs, defaultBaud, hexMode)
+
+	// Apply mode overrides from -m / --mode
+	modeOverrides := parseModeOverrides(rawModeConfigs)
+	for i := range configs {
+		if mode, ok := modeOverrides[strings.ToLower(configs[i].Port)]; ok {
+			configs[i].HexMode = mode
+		}
+		if mode, ok := modeOverrides[strings.ToLower(configs[i].Alias)]; ok {
+			configs[i].HexMode = mode
+		}
+	}
+
+	for _, cfg := range configs {
+		portHexModes.Store(strings.ToLower(cfg.Port), cfg.HexMode)
+		portHexModes.Store(strings.ToLower(cfg.Alias), cfg.HexMode)
+	}
 
 	if len(configs) == 0 {
 		fmt.Println("❌ 错误: 未指定有效的串口参数!")
@@ -198,7 +238,11 @@ func main() {
 		if cfg.Alias != cfg.Port {
 			aliasStr = fmt.Sprintf(" (Alias: %s)", cfg.Alias)
 		}
-		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate)
+		modeTag := "\033[1;36m[TEXT]\033[0m"
+		if cfg.HexMode {
+			modeTag = "\033[1;33m[HEX]\033[0m"
+		}
+		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate, modeTag)
 	}
 	fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
 	fmt.Printf(" 💡 [交互模式] 终端输入命令按回车可广播; 输入 Alias: cmd 或 COMx: cmd 可定向发送\n")
@@ -226,7 +270,7 @@ func main() {
 	// 1. Start Serial Pipelines for each configured port
 	for i, cfg := range configs {
 		color := ansiColors[i%len(ansiColors)]
-		go startPortPipeline(cfg.Port, cfg.Alias, cfg.BaudRate, color, logChan, &activePorts)
+		go startPortPipeline(cfg.Port, cfg.Alias, cfg.BaudRate, cfg.HexMode, color, logChan, &activePorts)
 	}
 
 	// 2. Start Console Interactive Command Reader (Broadcast or Target Command)
@@ -317,8 +361,51 @@ func main() {
 	}
 }
 
-// Parse input arguments like ["COM23,115200", "COM24,115200", "COM25,921600"]
-func parseSerialConfigs(args []string, defaultBaud int) []SerialConfig {
+// Helper to detect if an argument token is specifying a mode like "hex", "text", "com3,text", "com4=hex", etc.
+func isModeConfig(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, sep := range []string{",", "=", ":"} {
+		if idx := strings.Index(s, sep); idx > 0 {
+			mode := strings.TrimSpace(s[idx+1:])
+			if mode == "hex" || mode == "raw" || mode == "text" || mode == "ascii" || mode == "str" {
+				return true
+			}
+		}
+	}
+	return s == "hex" || s == "raw" || s == "text" || s == "ascii" || s == "str"
+}
+
+// parseModeOverrides parses entries like "com3,text", "com4=hex", "MCU:text"
+func parseModeOverrides(rawModes []string) map[string]bool {
+	overrides := make(map[string]bool)
+	for _, raw := range rawModes {
+		fields := strings.Fields(raw)
+		for _, f := range fields {
+			f = strings.TrimSpace(f)
+			if f == "" {
+				continue
+			}
+			var name, modeStr string
+			if idx := strings.IndexAny(f, ",=:"); idx > 0 {
+				name = strings.TrimSpace(f[:idx])
+				modeStr = strings.TrimSpace(f[idx+1:])
+			} else {
+				continue
+			}
+
+			modeStrLower := strings.ToLower(modeStr)
+			if modeStrLower == "hex" || modeStrLower == "raw" {
+				overrides[strings.ToLower(name)] = true
+			} else if modeStrLower == "text" || modeStrLower == "ascii" || modeStrLower == "str" {
+				overrides[strings.ToLower(name)] = false
+			}
+		}
+	}
+	return overrides
+}
+
+// Parse input arguments like ["COM23,115200", "COM24,115200", "COM25,921600,A1,hex"]
+func parseSerialConfigs(args []string, defaultBaud int, globalHex bool) []SerialConfig {
 	var results []SerialConfig
 	seen := make(map[string]bool)
 
@@ -341,15 +428,22 @@ func parseSerialConfigs(args []string, defaultBaud int) []SerialConfig {
 
 		baud := defaultBaud
 		alias := port
-		if len(parts) >= 2 {
-			if b, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil && b > 0 {
-				baud = b
+		isHex := globalHex
+
+		for _, part := range parts[1:] {
+			p := strings.TrimSpace(part)
+			if p == "" {
+				continue
 			}
-		}
-		if len(parts) >= 3 {
-			a := strings.TrimSpace(parts[2])
-			if a != "" {
-				alias = a
+			pLower := strings.ToLower(p)
+			if pLower == "hex" || pLower == "raw" {
+				isHex = true
+			} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
+				isHex = false
+			} else if b, err := strconv.Atoi(p); err == nil && b > 0 {
+				baud = b
+			} else {
+				alias = p
 			}
 		}
 
@@ -359,6 +453,7 @@ func parseSerialConfigs(args []string, defaultBaud int) []SerialConfig {
 				Port:     port,
 				BaudRate: baud,
 				Alias:    alias,
+				HexMode:  isHex,
 			})
 		}
 	}
@@ -366,7 +461,7 @@ func parseSerialConfigs(args []string, defaultBaud int) []SerialConfig {
 }
 
 // Dedicated port pipeline reading raw bytes, handling auto-reconnect, and emitting framed LogMessages
-func startPortPipeline(portName string, alias string, baudRate int, colorCode string, logChan chan<- LogMessage, activePorts *sync.Map) {
+func startPortPipeline(portName string, alias string, baudRate int, portHexMode bool, colorCode string, logChan chan<- LogMessage, activePorts *sync.Map) {
 	mode := &serial.Mode{
 		BaudRate: baudRate,
 	}
@@ -416,7 +511,7 @@ func startPortPipeline(portName string, alias string, baudRate int, colorCode st
 		hexRxChan := make(chan []byte, 100)
 		hexDoneChan := make(chan struct{})
 
-		if hexMode {
+		if portHexMode {
 			go func() {
 				defer close(hexDoneChan)
 				var hexBuf []byte
@@ -472,7 +567,7 @@ func startPortPipeline(portName string, alias string, baudRate int, colorCode st
 				now := time.Now()
 				chunk := buf[:n]
 
-				if hexMode {
+				if portHexMode {
 					hexRxChan <- append([]byte(nil), chunk...)
 				} else {
 					lineBuf.Write(chunk)
@@ -500,7 +595,7 @@ func startPortPipeline(portName string, alias string, baudRate int, colorCode st
 			}
 		}
 
-		if hexMode {
+		if portHexMode {
 			close(hexRxChan)
 			<-hexDoneChan
 		}
@@ -731,32 +826,34 @@ func parseCtrlCommand(cmdStr string) ([]byte, bool) {
 func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessage) {
 	targetName, targetPort, cmdStr, isTargeted := parseTargetAndCommand(text, activePorts)
 
-
-
 	var cmdBytes []byte
 	var err error
 
 	if ctrlBytes, ok := parseCtrlCommand(cmdStr); ok {
 		cmdBytes = ctrlBytes
-	} else if hexMode {
-		// Remove spaces and parse hex
-		cleanHex := strings.ReplaceAll(cmdStr, " ", "")
-		cmdBytes, err = hex.DecodeString(cleanHex)
-		if err != nil {
-			logChan <- LogMessage{
-				PortName:  "SYS",
-				Direction: "SYS",
-				ColorCode: "\033[1;31m", // Red
-				Timestamp: time.Now(),
-				Content:   fmt.Sprintf("❌ Hex 格式错误，忽略发送: %s", cmdStr),
-			}
-			return
-		}
-	} else {
-		cmdBytes = []byte(cmdStr + "\r\n")
 	}
 
 	if isTargeted {
+		if cmdBytes == nil {
+			if isPortHexMode(targetName) {
+				// Remove spaces and parse hex
+				cleanHex := strings.ReplaceAll(cmdStr, " ", "")
+				cmdBytes, err = hex.DecodeString(cleanHex)
+				if err != nil {
+					logChan <- LogMessage{
+						PortName:  "SYS",
+						Direction: "SYS",
+						ColorCode: "\033[1;31m", // Red
+						Timestamp: time.Now(),
+						Content:   fmt.Sprintf("❌ Hex 格式错误，忽略发送 -> %s: %s", targetName, cmdStr),
+					}
+					return
+				}
+			} else {
+				cmdBytes = []byte(cmdStr + "\r\n")
+			}
+		}
+
 		_, err := targetPort.Write(cmdBytes)
 		if err != nil {
 			logChan <- LogMessage{
@@ -778,17 +875,40 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 	} else {
 		// Broadcast command to all active ports
 		count := 0
+		var hexBytes []byte
+		cleanHex := strings.ReplaceAll(cmdStr, " ", "")
+		if b, e := hex.DecodeString(cleanHex); e == nil && len(b) > 0 {
+			hexBytes = b
+		}
+		textBytes := []byte(cmdStr + "\r\n")
+
 		activePorts.Range(func(key, value any) bool {
 			if p, ok := value.(serial.Port); ok {
-				_, _ = p.Write(cmdBytes)
-				count++
 				portName := key.(string)
-				logChan <- LogMessage{
-					PortName:  portName,
-					Direction: "TX",
-					ColorCode: "\033[1;35m", // Purple for TX
-					Timestamp: time.Now(),
-					Content:   cmdStr,
+				var sendData []byte
+				if cmdBytes != nil {
+					sendData = cmdBytes
+				} else if isPortHexMode(portName) {
+					if hexBytes != nil {
+						sendData = hexBytes
+					} else {
+						// Content is not valid hex, skip sending to hex-only port
+						return true
+					}
+				} else {
+					sendData = textBytes
+				}
+
+				if len(sendData) > 0 {
+					_, _ = p.Write(sendData)
+					count++
+					logChan <- LogMessage{
+						PortName:  portName,
+						Direction: "TX",
+						ColorCode: "\033[1;35m", // Purple for TX
+						Timestamp: time.Now(),
+						Content:   cmdStr,
+					}
 				}
 			}
 			return true

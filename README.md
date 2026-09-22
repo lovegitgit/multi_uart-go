@@ -37,18 +37,25 @@ Multi-UART Logger 是一款使用 Go 语言开发的轻量级、跨平台、高�
 # 开启网络转发并设置账号密码保护
 ./multi_uart_logger -p COM25,115200,A1 --listen 0.0.0.0:12345 --user admin --pass 123456
 
-# 开启 Hex 数据模式，并将聚合日志保存到 serial_log.txt
+# 开启全局 Hex 数据模式，并将聚合日志保存到 serial_log.txt
 ./multi_uart_logger -p COM26,921600 --hex --out serial_log.txt
+
+# 混合模式：开启全局 Hex，但使用 -m 将 COM23 单独指定为普通文本模式
+./multi_uart_logger -p COM23 -p COM24 -p COM25 --hex -m COM23,text
+
+# 内联模式：直接在 -p 传参中指定各个串口的模式
+./multi_uart_logger -p COM23,115200,A1,text -p COM24,921600,A2,hex
 ```
 
 ### 命令说明
 你可以使用 `help` 或 `--help` 随时查看所有命令行参数：
-* `-p` 或 `--port` : 串口配置参数，格式为 `COMx,Baud,Alias` 或 `/dev/ttyUSB0,115200,A1`
+* `-p` 或 `--port` : 串口配置参数，格式为 `COMx,Baud[,Alias[,Mode]]`（如 `-p COM25,115200,A1,hex` 或 `-p COM25,hex`）
+* `-m` 或 `--mode` : 单独设定或覆盖指定串口的收发模式，格式为 `COMx,hex` 或 `COMx,text`（支持以逗号/等号/冒号分隔，或多次指定 `-m`）
 * `-l` 或 `--list` : 列出当前系统中所有可用串口并退出
 * `-L` 或 `--listen`: 启动 Telnet 监听服务的 `IP:Port`
 * `--user` : Telnet 登录认证用户名 (留空则无密码)
 * `--pass` : Telnet 登录认证密码
-* `--hex` : 启用全包聚合后的 16 进制收发模式
+* `--hex` : 启用全局默认 16 进制收发模式 (未显式指定模式的串口均沿用此模式)
 * `-o` 或 `--out` : 日志输出文件保存路径
 * `-b` 或 `--baud` : 为没有提供波特率的串口设置全局默认波特率 (默认 115200)
 
