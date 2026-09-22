@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -47,10 +46,15 @@ type SerialConfig struct {
 var (
 	telnetClientsMutex sync.Mutex
 	telnetClients      = make(map[net.Conn]bool)
+	outMutex           sync.Mutex
 	hexMode            bool
 	portHexModes       sync.Map // lower(port/alias) -> bool
 	globalEOL          = "\r\n"
 	portEOLModes       sync.Map // lower(port/alias) -> string
+	plainMode          bool
+	noTime             bool
+	charMode           bool
+	logFileWriter      *os.File
 
 	origTerminalState *term.State
 )
@@ -148,6 +152,11 @@ func main() {
 	flag.IntVar(&defaultBaud, "baud", 115200, "同 -b")
 	flag.BoolVar(&hexMode, "hex", false, "启用全局默认 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)")
 	flag.StringVar(&eolFlag, "eol", "crlf", "全局文本模式发送行尾换行符: crlf (默认), lf, cr, none")
+	flag.BoolVar(&plainMode, "plain", false, "纯净终端直通模式 (隐藏端口名、时间戳及方向箭头，如 PuTTY/minicom)")
+	flag.BoolVar(&plainMode, "no-prefix", false, "同 --plain")
+	flag.BoolVar(&noTime, "no-time", false, "隐藏时间戳 (保留端口名及方向箭头)")
+	flag.BoolVar(&charMode, "char", false, "单键实时透传模式 (按键即刻发送无需回车，支持 MobaXterm 单键菜单交互)")
+	flag.BoolVar(&charMode, "raw-input", false, "同 --char")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "=======================================================================\n")
@@ -158,9 +167,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -p COM23,115200 -p COM24,115200\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -p COM3,-,-,text\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM5,-,-,-,cr -p COM6,115200,-,text,lf --eol crlf\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM24 --plain\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 --listen 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "参数说明:\n")
 		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或占位覆盖: -p COM3,-,-,text 或引号留空: -p \"COM5,,,,cr\")\n")
+		fmt.Fprintf(os.Stderr, "  --plain\n\t纯净终端直通模式 (隐藏端口名、时间戳及方向箭头，支持 \\r 原地刷新，如 MobaXterm 原生终端)\n")
+		fmt.Fprintf(os.Stderr, "  --char\n\t单键实时透传模式 (按键即刻发送无需回车，支持 MobaXterm 单键菜单交互)\n")
+		fmt.Fprintf(os.Stderr, "  --no-time\n\t隐藏时间戳 (保留端口名及方向箭头)\n")
 		fmt.Fprintf(os.Stderr, "  --eol string\n\t全局文本模式发送行尾换行符: crlf (默认), lf, cr, none\n")
 		fmt.Fprintf(os.Stderr, "  -l, --list\n\t列出当前系统所有可用串口并退出\n")
 		fmt.Fprintf(os.Stderr, "  -L, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: --listen 0.0.0.0:8023)\n")
@@ -201,6 +214,12 @@ func main() {
 			showFullDate = true
 		} else if args[i] == "--time-only" || args[i] == "-time-only" {
 			timeOnly = true
+		} else if args[i] == "--plain" || args[i] == "-plain" || args[i] == "--no-prefix" || args[i] == "-no-prefix" {
+			plainMode = true
+		} else if args[i] == "--char" || args[i] == "-char" || args[i] == "--raw-input" || args[i] == "-raw-input" {
+			charMode = true
+		} else if args[i] == "--no-time" || args[i] == "-no-time" {
+			noTime = true
 		} else if args[i] == "--hex" || args[i] == "-hex" {
 			hexMode = true
 		} else if (args[i] == "--eol" || args[i] == "-eol") && i+1 < len(args) {
@@ -248,7 +267,6 @@ func main() {
 	}
 
 	// Prepare Log File writer if requested
-	var logFileWriter *os.File
 	if logFile != "" {
 		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 		if err != nil {
@@ -273,9 +291,19 @@ func main() {
 		}
 		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s | EOL: %s\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate, modeTag, formatEOLDesc(cfg.EOL))
 	}
-	fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
+	if plainMode {
+		fmt.Printf(" 💡 [显示模式] 纯净直通终端模式 (--plain) [无时间戳/前缀，支持 \\r 原地自动刷新，对齐 MobaXterm]\n")
+	} else if noTime {
+		fmt.Printf(" 💡 [显示模式] 精简模式 (--no-time) [隐藏时间戳]\n")
+	} else {
+		fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
+	}
 	fmt.Printf(" 💡 [发送换行符] 全局默认: %s (可用 --eol 设置全局, 或 -p COMx,,,,<eol> 单独覆盖)\n", formatEOLDesc(globalEOL))
-	fmt.Printf(" 💡 [交互模式] 终端输入命令按回车可广播; 输入 Alias: cmd 或 COMx: cmd 可定向发送\n")
+	if charMode {
+		fmt.Printf(" 💡 [输入模式] 单键实时透传模式 (--char) [按键即发无需回车，对齐 MobaXterm 单键菜单交互]\n")
+	} else {
+		fmt.Printf(" 💡 [输入模式] 行缓冲编辑模式 (默认) [按回车发送; 定向: COMx: cmd; 广播: cmd; 可加 --char 开启单键透传]\n")
+	}
 	fmt.Printf(" 💡 [退出程序] 按 Ctrl+] 退出 multi_uart_logger\n")
 	fmt.Printf("=======================================================================\n\n")
 
@@ -293,8 +321,14 @@ func main() {
 		maxNameLen = 3 // Ensure "SYS" lines align nicely
 	}
 
-	termFormat := fmt.Sprintf("%%s[%%-%ds]%%s[%%s] %%s%%s", maxNameLen)
-	fileFormat := fmt.Sprintf("[%%-%ds][%%s] %%s%%s\n", maxNameLen)
+	var termFormat, fileFormat string
+	if noTime {
+		termFormat = fmt.Sprintf("%%s[%%-%ds]%%s %%s%%s", maxNameLen)
+		fileFormat = fmt.Sprintf("[%%-%ds] %%s%%s\n", maxNameLen)
+	} else {
+		termFormat = fmt.Sprintf("%%s[%%-%ds]%%s[%%s] %%s%%s", maxNameLen)
+		fileFormat = fmt.Sprintf("[%%-%ds][%%s] %%s%%s\n", maxNameLen)
+	}
 
 	// 1. Start Serial Pipelines for each configured port
 	for i, cfg := range configs {
@@ -342,15 +376,16 @@ func main() {
 	}
 
 	// 3. Main Thread: Collect & Merge Output Loop
-	var outMutex sync.Mutex
 	for msg := range logChan {
 		var timeStr string
-		if timeOnly {
-			timeStr = msg.Timestamp.Format("15:04:05.000000")
-		} else if showFullDate {
-			timeStr = msg.Timestamp.Format("2006-01-02 15:04:05.000000")
-		} else {
-			timeStr = msg.Timestamp.Format("01-02 15:04:05.000000") // Restored microsecond precision
+		if !noTime {
+			if timeOnly {
+				timeStr = msg.Timestamp.Format("15:04:05.000000")
+			} else if showFullDate {
+				timeStr = msg.Timestamp.Format("2006-01-02 15:04:05.000000")
+			} else {
+				timeStr = msg.Timestamp.Format("01-02 15:04:05.000000") // Restored microsecond precision
+			}
 		}
 
 		var dirStrTerm, dirStrFile string
@@ -365,28 +400,53 @@ func main() {
 			dirStrFile = ""
 		}
 
-		// COM port first format with dynamic alignment
-		termLine := fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, colorReset, timeStr, dirStrTerm, msg.Content)
+		// Ensure content never contains orphan \r that could reset cursor to column 0
+		safeContent := strings.ReplaceAll(msg.Content, "\r", "")
+
+		var termLine, plainLine string
+		if plainMode {
+			if msg.Direction == "SYS" {
+				termLine = fmt.Sprintf("%s%s%s", msg.ColorCode, safeContent, colorReset)
+				plainLine = fmt.Sprintf("[SYS] %s\n", safeContent)
+			} else if msg.Direction == "TX" {
+				// Don't duplicate locally echoed terminal input, but record to file
+				plainLine = fmt.Sprintf(">> %s\n", safeContent)
+			} else {
+				termLine = safeContent
+				plainLine = safeContent + "\n"
+			}
+		} else {
+			if noTime {
+				termLine = fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, colorReset, dirStrTerm, safeContent)
+				plainLine = fmt.Sprintf(fileFormat, msg.PortName, dirStrFile, safeContent)
+			} else {
+				termLine = fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, colorReset, timeStr, dirStrTerm, safeContent)
+				plainLine = fmt.Sprintf(fileFormat, msg.PortName, timeStr, dirStrFile, safeContent)
+			}
+		}
 
 		outMutex.Lock()
-		fmt.Println(termLine)
+		if termLine != "" || (plainMode && msg.Direction == "RX") {
+			fmt.Print(termLine + "\r\n")
+		}
 
 		// File Output (Plain text without ANSI color codes)
-		if logFileWriter != nil {
-			plainLine := fmt.Sprintf(fileFormat, msg.PortName, timeStr, dirStrFile, msg.Content)
+		if logFileWriter != nil && plainLine != "" {
 			_, _ = logFileWriter.WriteString(plainLine)
 		}
 
 		// Telnet Output
-		telnetClientsMutex.Lock()
-		for conn := range telnetClients {
-			_, err := conn.Write([]byte(termLine + "\r\n"))
-			if err != nil {
-				conn.Close()
-				delete(telnetClients, conn)
+		if termLine != "" {
+			telnetClientsMutex.Lock()
+			for conn := range telnetClients {
+				_, err := conn.Write([]byte(termLine + "\r\n"))
+				if err != nil {
+					conn.Close()
+					delete(telnetClients, conn)
+				}
 			}
+			telnetClientsMutex.Unlock()
 		}
-		telnetClientsMutex.Unlock()
 
 		outMutex.Unlock()
 	}
@@ -503,6 +563,68 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 	return results
 }
 
+// extractLines splits data by line breaks (\r\n, \n\r, \r, \n).
+// If flushAll is false and the buffer ends mid-line or at an unconfirmed trailing \r/\n,
+// the unconsumed remainder is returned.
+func extractLines(data []byte, flushAll bool) ([]string, []byte) {
+	var lines []string
+	start := 0
+	n := len(data)
+	i := 0
+
+	for i < n {
+		b := data[i]
+		if b == '\r' || b == '\n' {
+			// If we're at the very last byte and not flushing,
+			// wait in case a matching \n or \r arrives in the next packet.
+			if !flushAll && i == n-1 {
+				break
+			}
+
+			lineStr := string(data[start:i])
+			// Consume pair if \r\n or \n\r
+			if i+1 < n && ((b == '\r' && data[i+1] == '\n') || (b == '\n' && data[i+1] == '\r')) {
+				i += 2
+			} else {
+				i += 1
+			}
+			start = i
+
+			lineStr = strings.Trim(lineStr, "\r\n")
+			if strings.Contains(lineStr, "\r") {
+				parts := strings.Split(lineStr, "\r")
+				for _, p := range parts {
+					p = strings.Trim(p, "\r\n")
+					lines = append(lines, p)
+				}
+			} else {
+				lines = append(lines, lineStr)
+			}
+		} else {
+			i++
+		}
+	}
+
+	if start < n {
+		if flushAll {
+			remStr := strings.Trim(string(data[start:]), "\r\n")
+			if strings.Contains(remStr, "\r") {
+				parts := strings.Split(remStr, "\r")
+				for _, p := range parts {
+					p = strings.Trim(p, "\r\n")
+					lines = append(lines, p)
+				}
+			} else {
+				lines = append(lines, remStr)
+			}
+			return lines, nil
+		}
+		return lines, append([]byte(nil), data[start:]...)
+	}
+
+	return lines, nil
+}
+
 // Dedicated port pipeline reading raw bytes, handling auto-reconnect, and emitting framed LogMessages
 func startPortPipeline(portName string, alias string, baudRate int, portHexMode bool, colorCode string, logChan chan<- LogMessage, activePorts *sync.Map) {
 	mode := &serial.Mode{
@@ -548,7 +670,6 @@ func startPortPipeline(portName string, alias string, baudRate int, portHexMode 
 		}
 
 		buf := make([]byte, 4096)
-		var lineBuf bytes.Buffer
 
 		// --- Hex Mode Timer-based Flush ---
 		hexRxChan := make(chan []byte, 100)
@@ -593,6 +714,67 @@ func startPortPipeline(portName string, alias string, baudRate int, portHexMode 
 			}()
 		}
 
+		// --- Text Mode Timer-based Flush & Line Framing ---
+		textRxChan := make(chan []byte, 200)
+		textDoneChan := make(chan struct{})
+
+		if !portHexMode && !plainMode {
+			go func() {
+				defer close(textDoneChan)
+				var rawBuf []byte
+				timer := time.NewTimer(40 * time.Millisecond)
+				if !timer.Stop() {
+					<-timer.C
+				}
+
+				flushLines := func(flushAll bool) {
+					if len(rawBuf) == 0 {
+						return
+					}
+					lines, remainder := extractLines(rawBuf, flushAll)
+					rawBuf = remainder
+					now := time.Now()
+					for _, line := range lines {
+						if strings.TrimSpace(line) != "" {
+							logChan <- LogMessage{
+								PortName:  alias,
+								Direction: "RX",
+								ColorCode: colorCode,
+								Timestamp: now,
+								Content:   line,
+							}
+						}
+					}
+				}
+
+				for {
+					select {
+					case chunk, ok := <-textRxChan:
+						if !ok {
+							flushLines(true)
+							return
+						}
+						rawBuf = append(rawBuf, chunk...)
+						flushLines(false)
+						if len(rawBuf) > 0 {
+							timer.Reset(40 * time.Millisecond)
+						} else {
+							if !timer.Stop() {
+								select {
+								case <-timer.C:
+								default:
+								}
+							}
+						}
+					case <-timer.C:
+						flushLines(true)
+					}
+				}
+			}()
+		}
+
+		lastByteWasCR := false
+
 		// Read loop
 		for {
 			n, readErr := port.Read(buf)
@@ -607,33 +789,49 @@ func startPortPipeline(portName string, alias string, baudRate int, portHexMode 
 				break
 			}
 			if n > 0 {
-				now := time.Now()
 				chunk := buf[:n]
 
 				if portHexMode {
 					hexRxChan <- append([]byte(nil), chunk...)
-				} else {
-					lineBuf.Write(chunk)
-
-					for {
-						lineBytes, e := lineBuf.ReadBytes('\n')
-						if e != nil {
-							// Put uncompleted line snippet back into buffer for next read
-							lineBuf.Write(lineBytes)
-							break
-						}
-
-						content := strings.TrimRight(string(lineBytes), "\r\n")
-						if content != "" {
-							logChan <- LogMessage{
-								PortName:  alias,
-								Direction: "RX",
-								ColorCode: colorCode,
-								Timestamp: now,
-								Content:   content,
+				} else if plainMode {
+					// MobaXterm-aligned Raw Stream Passthrough:
+					// Direct streaming allows \r to refresh the line in place without spurious newlines
+					var outBuf []byte
+					for i := 0; i < len(chunk); i++ {
+						b := chunk[i]
+						if b == '\n' {
+							if (i > 0 && chunk[i-1] == '\r') || (i == 0 && lastByteWasCR) {
+								outBuf = append(outBuf, '\n')
+							} else {
+								outBuf = append(outBuf, '\r', '\n')
 							}
+						} else {
+							outBuf = append(outBuf, b)
 						}
 					}
+					lastByteWasCR = (chunk[len(chunk)-1] == '\r')
+
+					outMutex.Lock()
+					_, _ = os.Stdout.Write(outBuf)
+					outMutex.Unlock()
+
+					// File Output
+					if logFileWriter != nil {
+						_, _ = logFileWriter.Write(outBuf)
+					}
+
+					// Telnet Output
+					telnetClientsMutex.Lock()
+					for conn := range telnetClients {
+						_, err := conn.Write(outBuf)
+						if err != nil {
+							conn.Close()
+							delete(telnetClients, conn)
+						}
+					}
+					telnetClientsMutex.Unlock()
+				} else {
+					textRxChan <- append([]byte(nil), chunk...)
 				}
 			}
 		}
@@ -641,6 +839,9 @@ func startPortPipeline(portName string, alias string, baudRate int, portHexMode 
 		if portHexMode {
 			close(hexRxChan)
 			<-hexDoneChan
+		} else if !plainMode {
+			close(textRxChan)
+			<-textDoneChan
 		}
 
 		port.Close()
@@ -721,6 +922,63 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 				}
 				time.Sleep(100 * time.Millisecond)
 				os.Exit(0)
+			}
+
+			// Single-Key Real-Time Passthrough (Char Mode / MobaXterm style)
+			if charMode {
+				// Enter key (\r or \n): send configured EOL to active text ports
+				if b == '\r' || b == '\n' {
+					activePorts.Range(func(key, value any) bool {
+						portName, okKey := key.(string)
+						p, okVal := value.(serial.Port)
+						if okKey && okVal && !isPortHexMode(portName) {
+							eol := getPortEOL(portName)
+							if len(eol) > 0 {
+								_, _ = p.Write([]byte(eol))
+							} else {
+								_, _ = p.Write([]byte{b})
+							}
+						}
+						return true
+					})
+					continue
+				}
+
+				// Handle ESC & ANSI Escape Sequences (e.g. Arrow keys, Home, End)
+				if b == 0x1B {
+					seq := []byte{0x1B}
+					for {
+						bNext, okNext := readLineBytes(15 * time.Millisecond)
+						if !okNext {
+							break
+						}
+						seq = append(seq, bNext)
+						if (bNext >= 'A' && bNext <= 'Z') || (bNext >= 'a' && bNext <= 'z') || bNext == '~' {
+							break
+						}
+					}
+					activePorts.Range(func(key, value any) bool {
+						portName, okKey := key.(string)
+						p, okVal := value.(serial.Port)
+						if okKey && okVal && !isPortHexMode(portName) {
+							_, _ = p.Write(seq)
+						}
+						return true
+					})
+					continue
+				}
+
+				// All other characters (single keypress like 't', 'a', '1', Backspace, Tab, Ctrl+C, etc.):
+				// Send directly to active text-mode ports
+				activePorts.Range(func(key, value any) bool {
+					portName, okKey := key.(string)
+					p, okVal := value.(serial.Port)
+					if okKey && okVal && !isPortHexMode(portName) {
+						_, _ = p.Write([]byte{b})
+					}
+					return true
+				})
+				continue
 			}
 
 			// Handle ESC (0x1B) vs ANSI Escape Sequences (Arrow Keys, Delete, Home, End)
@@ -821,6 +1079,10 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 					historyIdx = -1
 
 					processInputCmd(text, activePorts, logChan)
+				} else {
+					// Empty Enter: wake up text-mode serial terminals by sending configured EOL,
+					// while strictly skipping hex-mode ports to avoid sending invalid bytes.
+					processEmptyEnter(activePorts)
 				}
 				continue
 			}
@@ -908,6 +1170,30 @@ func parseHexInput(s string) ([]byte, error) {
 	return hex.DecodeString(clean)
 }
 
+// processEmptyEnter sends configured EOL to active text-mode ports to wake up terminals/shells,
+// while strictly skipping hex-mode ports to prevent sending invalid data.
+func processEmptyEnter(activePorts *sync.Map) {
+	activePorts.Range(func(key, value any) bool {
+		portName, okKey := key.(string)
+		p, okVal := value.(serial.Port)
+		if !okKey || !okVal {
+			return true
+		}
+
+		// Strictly skip hex-mode ports: do not send invalid newline to binary/hex devices
+		if isPortHexMode(portName) {
+			return true
+		}
+
+		// Text mode port: send port-specific or global EOL
+		eol := getPortEOL(portName)
+		if len(eol) > 0 {
+			_, _ = p.Write([]byte(eol))
+		}
+		return true
+	})
+}
+
 func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessage) {
 	targetName, targetPort, cmdStr, isTargeted := parseTargetAndCommand(text, activePorts)
 
@@ -921,6 +1207,9 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 	if isTargeted {
 		if cmdBytes == nil {
 			if isPortHexMode(targetName) {
+				if cmdStr == "" {
+					return // Skip empty enter for targeted hex port
+				}
 				cmdBytes, err = parseHexInput(cmdStr)
 				if err != nil {
 					logChan <- LogMessage{
@@ -938,22 +1227,24 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 			}
 		}
 
-		_, err := targetPort.Write(cmdBytes)
-		if err != nil {
-			logChan <- LogMessage{
-				PortName:  "SYS",
-				Direction: "SYS",
-				ColorCode: "\033[1;31m",
-				Timestamp: time.Now(),
-				Content:   fmt.Sprintf("❌ [发送失败 -> %s]: %v", targetName, err),
-			}
-		} else {
-			logChan <- LogMessage{
-				PortName:  targetName,
-				Direction: "TX",
-				ColorCode: "\033[1;35m", // Purple for TX
-				Timestamp: time.Now(),
-				Content:   cmdStr,
+		if len(cmdBytes) > 0 {
+			_, err := targetPort.Write(cmdBytes)
+			if err != nil {
+				logChan <- LogMessage{
+					PortName:  "SYS",
+					Direction: "SYS",
+					ColorCode: "\033[1;31m",
+					Timestamp: time.Now(),
+					Content:   fmt.Sprintf("❌ [发送失败 -> %s]: %v", targetName, err),
+				}
+			} else if cmdStr != "" {
+				logChan <- LogMessage{
+					PortName:  targetName,
+					Direction: "TX",
+					ColorCode: "\033[1;35m", // Purple for TX
+					Timestamp: time.Now(),
+					Content:   cmdStr,
+				}
 			}
 		}
 	} else {
