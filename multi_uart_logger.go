@@ -132,7 +132,7 @@ func main() {
 	var defaultBaud int
 	var eolFlag string
 
-	flag.Var(&portFlags, "p", "串口配置 (单字母用 -p, 多字母可用 --port) 格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或留空覆盖: -p COM5,,,,cr)")
+	flag.Var(&portFlags, "p", "串口配置 (单字母用 -p, 多字母可用 --port) 格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或占位覆盖: -p COM3,-,-,text 或引号留空: -p \"COM5,,,,cr\")")
 	flag.Var(&portFlags, "port", "同 -p")
 	flag.StringVar(&logFile, "o", "", "指定可选的输出保存日志文件名 (例如: -o serial_all.log)")
 	flag.StringVar(&logFile, "out", "", "同 -o")
@@ -156,11 +156,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM23,115200 -p COM24,115200\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -p COM3,,,text\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(os.Stderr, "  %s -p COM5,,,,cr -p COM6,115200,,text,lf --eol crlf\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -p COM3,-,-,text\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM5,-,-,-,cr -p COM6,115200,-,text,lf --eol crlf\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 --listen 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "参数说明:\n")
-		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或留空覆盖: -p COM5,,,,cr)\n")
+		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或占位覆盖: -p COM3,-,-,text 或引号留空: -p \"COM5,,,,cr\")\n")
 		fmt.Fprintf(os.Stderr, "  --eol string\n\t全局文本模式发送行尾换行符: crlf (默认), lf, cr, none\n")
 		fmt.Fprintf(os.Stderr, "  -l, --list\n\t列出当前系统所有可用串口并退出\n")
 		fmt.Fprintf(os.Stderr, "  -L, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: --listen 0.0.0.0:8023)\n")
@@ -423,8 +423,8 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 
 		for idx, part := range parts[1:] {
 			p := strings.TrimSpace(part)
-			if p == "" {
-				continue // empty slot: preserve default/inherited value
+			if p == "" || p == "-" || p == "_" {
+				continue // empty slot or placeholder (e.g. com3,-,-,text): preserve default/inherited value
 			}
 			pLower := strings.ToLower(p)
 			pos := idx + 1 // 1: baud, 2: alias, 3: mode, 4: eol
