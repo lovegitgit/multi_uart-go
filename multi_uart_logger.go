@@ -324,12 +324,14 @@ func main() {
 				}
 				return true
 			})
-			logChan <- LogMessage{
-				PortName:  "SYS",
-				Direction: "SYS",
-				ColorCode: "\033[1;35m",
-				Timestamp: time.Now(),
-				Content:   fmt.Sprintf("📢 [捕获系统信号 %s] 已向 %d 个串口透传广播下发 0x%02X。退出程序请输入 'exit' 或 'q'", sigName, count, ctrlBytes[0]),
+			if count > 1 {
+				logChan <- LogMessage{
+					PortName:  "SYS",
+					Direction: "SYS",
+					ColorCode: "\033[1;35m",
+					Timestamp: time.Now(),
+					Content:   fmt.Sprintf("📢 [捕获系统信号 %s] 已向 %d 个串口透传广播下发 0x%02X", sigName, count, ctrlBytes[0]),
+				}
 			}
 		}
 	}()
@@ -835,12 +837,14 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 					}
 					return true
 				})
-				logChan <- LogMessage{
-					PortName:  "SYS",
-					Direction: "SYS",
-					ColorCode: "\033[1;35m",
-					Timestamp: time.Now(),
-					Content:   fmt.Sprintf("📢 [键盘物理按键 0x%02X] 已向 %d 个串口透传广播下发", b, count),
+				if count > 1 {
+					logChan <- LogMessage{
+						PortName:  "SYS",
+						Direction: "SYS",
+						ColorCode: "\033[1;35m",
+						Timestamp: time.Now(),
+						Content:   fmt.Sprintf("📢 [键盘物理按键 0x%02X] 已向 %d 个串口透传广播下发", b, count),
+					}
 				}
 				continue
 			}
@@ -970,12 +974,22 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 			return true
 		})
 
-		logChan <- LogMessage{
-			PortName:  "SYS",
-			Direction: "SYS",
-			ColorCode: "\033[1;37m",
-			Timestamp: time.Now(),
-			Content:   fmt.Sprintf("📢 [广播命令 -> %d 个串口]: %s", count, cmdStr),
+		if count > 1 {
+			logChan <- LogMessage{
+				PortName:  "SYS",
+				Direction: "SYS",
+				ColorCode: "\033[1;37m",
+				Timestamp: time.Now(),
+				Content:   fmt.Sprintf("📢 [广播命令 -> %d 个串口]: %s", count, cmdStr),
+			}
+		} else if count == 0 {
+			logChan <- LogMessage{
+				PortName:  "SYS",
+				Direction: "SYS",
+				ColorCode: "\033[1;33m",
+				Timestamp: time.Now(),
+				Content:   fmt.Sprintf("⚠️ 当前无可用已连接串口，命令未发送: %s", cmdStr),
+			}
 		}
 	}
 }
