@@ -625,13 +625,18 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 		}
 	}
 
+	refreshLine := func() {
+		fmt.Print("\r\033[2K")
+		fmt.Print(string(input))
+		moveCursorLeft(len(input) - cursor)
+	}
+
 	setInput := func(text string) {
 		// Clear the old line, draw the recalled line, and leave the cursor at
 		// its end. This also handles recalling a shorter history entry.
-		fmt.Print("\r\033[2K")
 		input = []rune(text)
 		cursor = len(input)
-		fmt.Print(string(input))
+		refreshLine()
 	}
 
 	readLineBytes := func(timeout time.Duration) (byte, bool) {
@@ -730,6 +735,31 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 								cursor++
 							}
 							continue
+						} else if b3 == 'H' { // Home Key (\x1b[H or \x1bOH)
+							cursor = 0
+							refreshLine()
+							continue
+						} else if b3 == 'F' { // End Key (\x1b[F or \x1bOF)
+							cursor = len(input)
+							refreshLine()
+							continue
+						} else if b3 >= '0' && b3 <= '9' {
+							b4, ok4 := readLineBytes(10 * time.Millisecond)
+							if ok4 && b4 == '~' {
+								if b3 == '3' { // Delete Key (\x1b[3~)
+									if cursor < len(input) {
+										input = append(input[:cursor], input[cursor+1:]...)
+										refreshLine()
+									}
+								} else if b3 == '1' { // Home Key (\x1b[1~)
+									cursor = 0
+									refreshLine()
+								} else if b3 == '4' { // End Key (\x1b[4~)
+									cursor = len(input)
+									refreshLine()
+								}
+							}
+							continue
 						}
 					}
 				}
@@ -739,19 +769,9 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 			// Handle Backspace (0x08 or 0x7F)
 			if b == 0x08 || b == 0x7F {
 				if cursor > 0 {
-					if cursor == len(input) {
-						// The common case: preserve the traditional backspace
-						// sequence, which works on terminals with limited ANSI support.
-						fmt.Print("\b \b")
-						input = input[:cursor-1]
-						cursor--
-					} else {
-						// When deleting in the middle, redraw the shifted suffix.
-						input = append(input[:cursor-1], input[cursor:]...)
-						cursor--
-						fmt.Print(string(input[cursor:]), " ")
-						moveCursorLeft(len(input) - cursor + 1)
-					}
+					input = append(input[:cursor-1], input[cursor:]...)
+					cursor--
+					refreshLine()
 				}
 				continue
 			}
@@ -797,12 +817,17 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 
 			// Regular printable character: buffer it and echo locally
 			if b >= 0x20 {
-				input = append(input, 0)
-				copy(input[cursor+1:], input[cursor:])
-				input[cursor] = rune(b)
-				cursor++
-				fmt.Printf("%c", b)
-				moveCursorLeft(len(input) - cursor)
+				if cursor == len(input) {
+					input = append(input, rune(b))
+					cursor++
+					fmt.Printf("%c", b)
+				} else {
+					input = append(input, 0)
+					copy(input[cursor+1:], input[cursor:])
+					input[cursor] = rune(b)
+					cursor++
+					refreshLine()
+				}
 			}
 		}
 	}
