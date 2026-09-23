@@ -100,23 +100,23 @@ go mod tidy
 **A. 编译为 Windows 可执行文件 (.exe)**
 无论你当前是在 Linux, macOS 还是 Windows，均可生成 Windows 程序：
 ```bash
-GOOS=windows GOARCH=amd64 go build -o multi_uart_logger.exe multi_uart_logger.go
+GOOS=windows GOARCH=amd64 go build -o multi_uart_logger.exe .
 ```
 
 **B. 编译为 Linux 可执行文件**
 适用于标准的 Ubuntu / Debian / CentOS 服务器或桌面版：
 ```bash
-GOOS=linux GOARCH=amd64 go build -o multi_uart_logger multi_uart_logger.go
+GOOS=linux GOARCH=amd64 go build -o multi_uart_logger .
 ```
 *提示：如果是树莓派或 ARM 架构开发板，请将 `GOARCH=amd64` 改为 `GOARCH=arm64`。*
 
 **C. 编译为 macOS (Intel/M系列)**
 ```bash
 # 适用于 M1/M2/M3 等 Apple Silicon 芯片：
-GOOS=darwin GOARCH=arm64 go build -o multi_uart_logger_mac multi_uart_logger.go
+GOOS=darwin GOARCH=arm64 go build -o multi_uart_logger_mac .
 
 # 适用于老款 Intel Mac 芯片：
-GOOS=darwin GOARCH=amd64 go build -o multi_uart_logger_mac multi_uart_logger.go
+GOOS=darwin GOARCH=amd64 go build -o multi_uart_logger_mac .
 ```
 
 编译完成后，同目录下即会生成轻量的独立可执行文件，**你无需在此目标机器上安装任何依赖环境（包括 Go）即可直接运行此程序！**

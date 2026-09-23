@@ -40,6 +40,7 @@ type SerialConfig struct {
 	BaudRate int
 	Alias    string
 	HexMode  bool
+	HciMode  bool
 	EOL      string
 }
 
@@ -49,6 +50,8 @@ var (
 	outMutex           sync.Mutex
 	hexMode            bool
 	portHexModes       sync.Map // lower(port/alias) -> bool
+	hciMode            bool
+	portHciModes       sync.Map // lower(port/alias) -> bool
 	globalEOL          = "\r\n"
 	portEOLModes       sync.Map // lower(port/alias) -> string
 	plainMode          bool
@@ -64,6 +67,13 @@ func isPortHexMode(name string) bool {
 		return v.(bool)
 	}
 	return hexMode
+}
+
+func isPortHciMode(name string) bool {
+	if v, ok := portHciModes.Load(strings.ToLower(name)); ok {
+		return v.(bool)
+	}
+	return hciMode
 }
 
 func getPortEOL(name string) string {
@@ -151,6 +161,7 @@ func main() {
 	flag.IntVar(&defaultBaud, "b", 115200, "未指定波特率时的默认波特率")
 	flag.IntVar(&defaultBaud, "baud", 115200, "同 -b")
 	flag.BoolVar(&hexMode, "hex", false, "启用全局默认 Hex 模式 (收发数据以空格分隔的 16 进制显示/解析)")
+	flag.BoolVar(&hciMode, "hci", false, "启用 BLE HCI 指令解析与快捷预设指令模式 (支持 /cmds, /reset, /adv 等及 Tab 补全)")
 	flag.StringVar(&eolFlag, "eol", "crlf", "全局文本模式发送行尾换行符: crlf (默认), lf, cr, none")
 	flag.BoolVar(&plainMode, "plain", false, "纯净终端直通模式 (隐藏端口名、时间戳及方向箭头，如 PuTTY/minicom)")
 	flag.BoolVar(&plainMode, "no-prefix", false, "同 --plain")
@@ -168,9 +179,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -p COM3 COM4 COM5 --hex -p COM3,-,-,text\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM5,-,-,-,cr -p COM6,115200,-,text,lf --eol crlf\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s -p COM24 --plain\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "  %s -p COM24,115200,BLE,hci\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "  %s --port COM23,115200 --listen 0.0.0.0:8023 --user admin --pass 123456 --hex\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(os.Stderr, "参数说明:\n")
-		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或占位覆盖: -p COM3,-,-,text 或引号留空: -p \"COM5,,,,cr\")\n")
+		fmt.Fprintf(os.Stderr, "  -p, --port string\n\t串口配置，格式: COMx[,Baud[,Alias[,Mode[,EOL]]]] (如: -p COM25,115200,A1,text,lf 或 -p COM24,115200,BLE,hci 或占位覆盖: -p COM3,-,-,text 或引号留空: -p \"COM5,,,,cr\")\n")
+		fmt.Fprintf(os.Stderr, "  --hci\n\t启用全局 BLE HCI 指令解析模式 (包含 /cmds 快捷指令库与 Tab 自动补全)\n")
 		fmt.Fprintf(os.Stderr, "  --plain\n\t纯净终端直通模式 (隐藏端口名、时间戳及方向箭头，支持 \\r 原地刷新，如 MobaXterm 原生终端)\n")
 		fmt.Fprintf(os.Stderr, "  --char\n\t单键实时透传模式 (按键即刻发送无需回车，支持 MobaXterm 单键菜单交互)\n")
 		fmt.Fprintf(os.Stderr, "  --no-time\n\t隐藏时间戳 (保留端口名及方向箭头)\n")
@@ -222,6 +235,8 @@ func main() {
 			noTime = true
 		} else if args[i] == "--hex" || args[i] == "-hex" {
 			hexMode = true
+		} else if args[i] == "--hci" || args[i] == "-hci" {
+			hciMode = true
 		} else if (args[i] == "--eol" || args[i] == "-eol") && i+1 < len(args) {
 			eolFlag = args[i+1]
 			i++
@@ -245,11 +260,13 @@ func main() {
 		globalEOL = parsedEOL
 	}
 
-	configs := parseSerialConfigs(rawPortConfigs, defaultBaud, hexMode, globalEOL)
+	configs := parseSerialConfigs(rawPortConfigs, defaultBaud, hexMode, hciMode, globalEOL)
 
 	for _, cfg := range configs {
 		portHexModes.Store(strings.ToLower(cfg.Port), cfg.HexMode)
 		portHexModes.Store(strings.ToLower(cfg.Alias), cfg.HexMode)
+		portHciModes.Store(strings.ToLower(cfg.Port), cfg.HciMode)
+		portHciModes.Store(strings.ToLower(cfg.Alias), cfg.HciMode)
 		portEOLModes.Store(strings.ToLower(cfg.Port), cfg.EOL)
 		portEOLModes.Store(strings.ToLower(cfg.Alias), cfg.EOL)
 	}
@@ -286,7 +303,9 @@ func main() {
 			aliasStr = fmt.Sprintf(" (Alias: %s)", cfg.Alias)
 		}
 		modeTag := "\033[1;36m[TEXT]\033[0m"
-		if cfg.HexMode {
+		if cfg.HciMode {
+			modeTag = "\033[1;35m[HCI]\033[0m"
+		} else if cfg.HexMode {
 			modeTag = "\033[1;33m[HEX]\033[0m"
 		}
 		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s | EOL: %s\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate, modeTag, formatEOLDesc(cfg.EOL))
@@ -303,6 +322,16 @@ func main() {
 		fmt.Printf(" 💡 [输入模式] 单键实时透传模式 (--char) [按键即发无需回车，对齐 MobaXterm 单键菜单交互]\n")
 	} else {
 		fmt.Printf(" 💡 [输入模式] 行缓冲编辑模式 (默认) [按回车发送; 定向: COMx: cmd; 广播: cmd; 可加 --char 开启单键透传]\n")
+	}
+	anyHci := hciMode
+	for _, cfg := range configs {
+		if cfg.HciMode {
+			anyHci = true
+			break
+		}
+	}
+	if anyHci {
+		fmt.Printf(" 💡 [HCI 模式] 已启用 BLE HCI 指令解析; 输入 /cmds 查看快捷指令, 支持 Tab 自动补全\n")
 	}
 	fmt.Printf(" 💡 [退出程序] 按 Ctrl+] 退出 multi_uart_logger\n")
 	fmt.Printf("=======================================================================\n\n")
@@ -388,20 +417,30 @@ func main() {
 			}
 		}
 
+		// Ensure content never contains orphan \r that could reset cursor to column 0
+		safeContent := strings.ReplaceAll(msg.Content, "\r", "")
+
 		var dirStrTerm, dirStrFile string
 		if msg.Direction == "RX" {
-			dirStrTerm = "\033[1;36m<<\033[0m "
-			dirStrFile = "<< "
+			if strings.HasPrefix(safeContent, "💡") || strings.HasPrefix(safeContent, "   ") {
+				dirStrTerm = "   "
+				dirStrFile = "   "
+			} else {
+				dirStrTerm = "\033[1;36m<<\033[0m "
+				dirStrFile = "<< "
+			}
 		} else if msg.Direction == "TX" {
-			dirStrTerm = "\033[1;35m>>\033[0m " // Magenta for TX
-			dirStrFile = ">> "
+			if strings.HasPrefix(safeContent, "💡") || strings.HasPrefix(safeContent, "   ") {
+				dirStrTerm = "   "
+				dirStrFile = "   "
+			} else {
+				dirStrTerm = "\033[1;35m>>\033[0m " // Magenta for TX
+				dirStrFile = ">> "
+			}
 		} else {
 			dirStrTerm = ""
 			dirStrFile = ""
 		}
-
-		// Ensure content never contains orphan \r that could reset cursor to column 0
-		safeContent := strings.ReplaceAll(msg.Content, "\r", "")
 
 		var termLine, plainLine string
 		if plainMode {
@@ -409,11 +448,25 @@ func main() {
 				termLine = fmt.Sprintf("%s%s%s", msg.ColorCode, safeContent, colorReset)
 				plainLine = fmt.Sprintf("[SYS] %s\n", safeContent)
 			} else if msg.Direction == "TX" {
-				// Don't duplicate locally echoed terminal input, but record to file
-				plainLine = fmt.Sprintf(">> %s\n", safeContent)
+				if isPortHciMode(msg.PortName) || strings.HasPrefix(safeContent, "💡") {
+					if strings.HasPrefix(safeContent, "💡") || strings.HasPrefix(safeContent, "   ") {
+						termLine = fmt.Sprintf("%s   %s%s", msg.ColorCode, safeContent, colorReset)
+						plainLine = fmt.Sprintf("   %s\n", safeContent)
+					} else {
+						termLine = fmt.Sprintf("%s>> %s%s", msg.ColorCode, safeContent, colorReset)
+						plainLine = fmt.Sprintf(">> %s\n", safeContent)
+					}
+				} else {
+					plainLine = fmt.Sprintf(">> %s\n", safeContent)
+				}
 			} else {
-				termLine = safeContent
-				plainLine = safeContent + "\n"
+				if strings.HasPrefix(safeContent, "💡") || strings.HasPrefix(safeContent, "   ") {
+					termLine = fmt.Sprintf("%s   %s%s", msg.ColorCode, safeContent, colorReset)
+					plainLine = fmt.Sprintf("   %s\n", safeContent)
+				} else {
+					termLine = safeContent
+					plainLine = safeContent + "\n"
+				}
 			}
 		} else {
 			if noTime {
@@ -455,7 +508,7 @@ func main() {
 
 
 // Parse input arguments like ["COM23,115200", "COM24,115200", "COM25,921600,A1,hex", "COM5,,,,cr"]
-func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultEOL string) []SerialConfig {
+func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, globalHci bool, defaultEOL string) []SerialConfig {
 	var results []SerialConfig
 	seen := make(map[string]bool)
 
@@ -478,7 +531,8 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 
 		baud := defaultBaud
 		alias := port
-		isHex := globalHex
+		isHex := globalHex || globalHci
+		isHci := globalHci
 		eol := defaultEOL
 
 		for idx, part := range parts[1:] {
@@ -493,10 +547,14 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 			case 1:
 				if b, err := strconv.Atoi(p); err == nil && b > 0 {
 					baud = b
+				} else if pLower == "hci" {
+					isHci = true
+					isHex = true
 				} else if pLower == "hex" || pLower == "raw" {
 					isHex = true
 				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
 					isHex = false
+					isHci = false
 				} else if parsedEOL, ok := parseEOL(pLower); ok {
 					eol = parsedEOL
 				} else {
@@ -505,20 +563,28 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 			case 2:
 				if b, err := strconv.Atoi(p); err == nil && b > 0 {
 					baud = b
+				} else if pLower == "hci" {
+					isHci = true
+					isHex = true
 				} else if pLower == "hex" || pLower == "raw" {
 					isHex = true
 				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
 					isHex = false
+					isHci = false
 				} else if parsedEOL, ok := parseEOL(pLower); ok {
 					eol = parsedEOL
 				} else {
 					alias = p
 				}
 			case 3:
-				if pLower == "hex" || pLower == "raw" {
+				if pLower == "hci" {
+					isHci = true
+					isHex = true
+				} else if pLower == "hex" || pLower == "raw" {
 					isHex = true
 				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
 					isHex = false
+					isHci = false
 				} else if parsedEOL, ok := parseEOL(pLower); ok {
 					eol = parsedEOL
 				} else if b, err := strconv.Atoi(p); err == nil && b > 0 {
@@ -529,10 +595,14 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 			case 4:
 				if parsedEOL, ok := parseEOL(pLower); ok {
 					eol = parsedEOL
+				} else if pLower == "hci" {
+					isHci = true
+					isHex = true
 				} else if pLower == "hex" || pLower == "raw" {
 					isHex = true
 				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
 					isHex = false
+					isHci = false
 				} else if b, err := strconv.Atoi(p); err == nil && b > 0 {
 					baud = b
 				} else {
@@ -541,10 +611,14 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 			default:
 				if parsedEOL, ok := parseEOL(pLower); ok {
 					eol = parsedEOL
+				} else if pLower == "hci" {
+					isHci = true
+					isHex = true
 				} else if pLower == "hex" || pLower == "raw" {
 					isHex = true
 				} else if pLower == "text" || pLower == "ascii" || pLower == "str" {
 					isHex = false
+					isHci = false
 				}
 			}
 		}
@@ -556,6 +630,7 @@ func parseSerialConfigs(args []string, defaultBaud int, globalHex bool, defaultE
 				BaudRate: baud,
 				Alias:    alias,
 				HexMode:  isHex,
+				HciMode:  isHci,
 				EOL:      eol,
 			})
 		}
@@ -683,30 +758,97 @@ func startPortPipeline(portName string, alias string, baudRate int, portHexMode 
 				if !timer.Stop() {
 					<-timer.C
 				}
+
+				flushPacket := func(pkt []byte) {
+					if len(pkt) == 0 {
+						return
+					}
+					var sb strings.Builder
+					for j, b := range pkt {
+						if j > 0 {
+							sb.WriteByte(' ')
+						}
+						fmt.Fprintf(&sb, "%02X", b)
+					}
+					now := time.Now()
+					logChan <- LogMessage{
+						PortName:  alias,
+						Direction: "RX",
+						ColorCode: colorCode,
+						Timestamp: now,
+						Content:   sb.String(),
+					}
+					if isPortHciMode(portName) {
+						if explainLines := parseHciEventLines(pkt); len(explainLines) > 0 {
+							for _, l := range explainLines {
+								logChan <- LogMessage{
+									PortName:  alias,
+									Direction: "RX",
+									ColorCode: "\033[1;36m",
+									Timestamp: now,
+									Content:   l,
+								}
+							}
+						}
+					}
+				}
+
 				for {
 					select {
 					case chunk, ok := <-hexRxChan:
 						if !ok {
+							flushPacket(hexBuf)
 							return // Port closed, exit goroutine
 						}
 						hexBuf = append(hexBuf, chunk...)
-						timer.Reset(30 * time.Millisecond) // Flush after 30ms of silence
+
+						// In HCI mode: frame complete H4 packets immediately
+						if isPortHciMode(portName) {
+							for len(hexBuf) >= 3 {
+								pktType := hexBuf[0]
+								expectedLen := 0
+								if pktType == 0x04 { // HCI Event
+									paramLen := int(hexBuf[2])
+									expectedLen = 3 + paramLen
+								} else if pktType == 0x01 { // HCI Command
+									if len(hexBuf) < 4 {
+										break
+									}
+									paramLen := int(hexBuf[3])
+									expectedLen = 4 + paramLen
+								} else if pktType == 0x02 { // HCI ACL Data
+									if len(hexBuf) < 5 {
+										break
+									}
+									dataLen := int(hexBuf[3]) | (int(hexBuf[4]) << 8)
+									expectedLen = 5 + dataLen
+								} else {
+									break
+								}
+
+								if expectedLen > 0 && len(hexBuf) >= expectedLen {
+									packet := hexBuf[:expectedLen]
+									hexBuf = hexBuf[expectedLen:]
+									flushPacket(packet)
+									continue
+								}
+								break
+							}
+						}
+
+						if len(hexBuf) > 0 {
+							timer.Reset(30 * time.Millisecond) // Flush after 30ms of silence
+						} else {
+							if !timer.Stop() {
+								select {
+								case <-timer.C:
+								default:
+								}
+							}
+						}
 					case <-timer.C:
 						if len(hexBuf) > 0 {
-							var sb strings.Builder
-							for j, b := range hexBuf {
-								if j > 0 {
-									sb.WriteByte(' ')
-								}
-								fmt.Fprintf(&sb, "%02X", b)
-							}
-							logChan <- LogMessage{
-								PortName:  alias,
-								Direction: "RX",
-								ColorCode: colorCode,
-								Timestamp: time.Now(),
-								Content:   sb.String(),
-							}
+							flushPacket(hexBuf)
 							hexBuf = hexBuf[:0]
 						}
 					}
@@ -899,6 +1041,103 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 		}
 	}
 
+	handleTabCompletion := func() {
+		currStr := string(input[:cursor])
+		// 1. If empty or single slash: show list of all preset commands
+		if currStr == "" || currStr == "/" {
+			outMutex.Lock()
+			fmt.Printf("\r\n\033[1;36m💡 预设 HCI 快捷指令: %s\033[0m\r\n", strings.Join(presetHciCmdOrder, "  "))
+			outMutex.Unlock()
+			if currStr == "" {
+				input = []rune("/")
+				cursor = 1
+			}
+			refreshLine()
+			return
+		}
+
+		// 2. Command name or parameter completion
+		if strings.HasPrefix(currStr, "/") {
+			if strings.Contains(currStr, " ") {
+				// Parameter completion
+				parts := strings.Fields(currStr)
+				cmdVerb := strings.ToLower(parts[0])
+				switch cmdVerb {
+				case "/adv":
+					if strings.HasSuffix(currStr, "on") {
+						setInput("/adv off")
+					} else {
+						setInput("/adv on")
+					}
+				case "/scan":
+					if strings.HasSuffix(currStr, "on") {
+						setInput("/scan off")
+					} else {
+						setInput("/scan on")
+					}
+				case "/advparam":
+					if len(parts) == 1 {
+						setInput("/advparam 100")
+					}
+				case "/scanparam":
+					if len(parts) == 1 {
+						setInput("/scanparam active 100 50")
+					}
+				case "/dtm-tx":
+					if len(parts) == 1 {
+						setInput("/dtm-tx 0 37 0")
+					}
+				case "/dtm-rx":
+					if len(parts) == 1 {
+						setInput("/dtm-rx 0")
+					}
+				case "/txpower", "/nxp-txpower":
+					if len(parts) == 1 {
+						setInput("/txpower 8 1")
+					} else if len(parts) == 2 {
+						setInput(parts[0] + " " + parts[1] + " 1")
+					}
+				default:
+					if hint := getHciCmdParamHint(cmdVerb); hint != "" {
+						outMutex.Lock()
+						fmt.Printf("\r\n\033[1;33m💡 参数提示: %s\033[0m\r\n", hint)
+						outMutex.Unlock()
+						refreshLine()
+					}
+				}
+				return
+			}
+
+			// Complete command name
+			var matches []string
+			lowerCurr := strings.ToLower(currStr)
+			for _, name := range presetHciCmdOrder {
+				if strings.HasPrefix(name, lowerCurr) {
+					matches = append(matches, name)
+				}
+			}
+
+			if len(matches) == 1 {
+				match := matches[0]
+				newPrefix := match + " "
+				input = append([]rune(newPrefix), input[cursor:]...)
+				cursor = len(newPrefix)
+				refreshLine()
+			} else if len(matches) > 1 {
+				lcp := findLCP(matches)
+				if len(lcp) > len(currStr) {
+					input = append([]rune(lcp), input[cursor:]...)
+					cursor = len(lcp)
+				}
+				outMutex.Lock()
+				fmt.Printf("\r\n\033[1;36m💡 候选指令: %s\033[0m\r\n", strings.Join(matches, "  "))
+				outMutex.Unlock()
+				refreshLine()
+			}
+			return
+		}
+	}
+
 	for {
 		n, err := os.Stdin.Read(buf)
 		if err != nil {
@@ -1087,6 +1326,12 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 				continue
 			}
 
+			// Handle Tab (0x09): Auto-completion & Suggestions
+			if b == '\t' || b == 0x09 {
+				handleTabCompletion()
+				continue
+			}
+
 			// Instant passthrough for Control Characters:
 			// Ctrl+C (0x03), Ctrl+Z (0x1A), Ctrl+D (0x04), Ctrl+\ (0x1C), etc.
 			if b < 0x20 && b != '\t' {
@@ -1197,6 +1442,12 @@ func processEmptyEnter(activePorts *sync.Map) {
 func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessage) {
 	targetName, targetPort, cmdStr, isTargeted := parseTargetAndCommand(text, activePorts)
 
+	// Check if this is an HCI slash command (e.g. /cmds, /reset, /adv on)
+	if strings.HasPrefix(cmdStr, "/") {
+		handleHciSlashCommand(targetName, targetPort, isTargeted, cmdStr, activePorts, logChan)
+		return
+	}
+
 	var cmdBytes []byte
 	var err error
 
@@ -1238,12 +1489,26 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 					Content:   fmt.Sprintf("❌ [发送失败 -> %s]: %v", targetName, err),
 				}
 			} else if cmdStr != "" {
+				now := time.Now()
 				logChan <- LogMessage{
 					PortName:  targetName,
 					Direction: "TX",
 					ColorCode: "\033[1;35m", // Purple for TX
-					Timestamp: time.Now(),
+					Timestamp: now,
 					Content:   cmdStr,
+				}
+				if isPortHciMode(targetName) && len(cmdBytes) > 0 {
+					if explainLines := parseHciCommandLines(cmdBytes); len(explainLines) > 0 {
+						for _, l := range explainLines {
+							logChan <- LogMessage{
+								PortName:  targetName,
+								Direction: "TX",
+								ColorCode: "\033[1;35m",
+								Timestamp: now,
+								Content:   l,
+							}
+						}
+					}
 				}
 			}
 		}
@@ -1315,12 +1580,26 @@ func processInputCmd(text string, activePorts *sync.Map, logChan chan<- LogMessa
 				if len(sendData) > 0 {
 					_, _ = p.Write(sendData)
 					count++
+					now := time.Now()
 					logChan <- LogMessage{
 						PortName:  portName,
 						Direction: "TX",
 						ColorCode: "\033[1;35m", // Purple for TX
-						Timestamp: time.Now(),
+						Timestamp: now,
 						Content:   cmdStr,
+					}
+					if isPortHciMode(portName) && len(sendData) > 0 {
+						if explainLines := parseHciCommandLines(sendData); len(explainLines) > 0 {
+							for _, l := range explainLines {
+								logChan <- LogMessage{
+									PortName:  portName,
+									Direction: "TX",
+									ColorCode: "\033[1;35m",
+									Timestamp: now,
+									Content:   l,
+								}
+							}
+						}
 					}
 				}
 			}
