@@ -9,20 +9,21 @@ Multi-UART Logger 是一款使用 Go 语言开发的轻量级、跨平台、高�
 - **收发方向标识与微秒级时间戳**：日志前缀清晰包含 `<<` (RX) 与 `>>` (TX) 标识，并具备微秒级时间戳（`MM-DD HH:MM:SS.ffffff`）。
 - **统一灵活的交互命令行与系统指令**：
   - 广播发送：直接输入 `reset` 广播给所有串口。
-  - 定向发送：支持 `A1: reset`、`62-reset` 或 `COM62: reset` 向特定串口下发。
-  - 系统指令：输入 `SYS: help` 随时在终端内调出内置交互指南。
+  - 定向发送：支持 `A1: reset`、`62-reset`、`COM62: reset` 或 `COM62 reset` 向特定串口下发。
+  - 单键实时透传 (`--char`) 与纯净直通模式 (`--plain`)：对齐 MobaXterm / PuTTY 原生终端交互体验。
 - **网络 Telnet 转发与远程调试**：内置支持身份认证（账号/密码）的网络 Telnet 服务。你可以将测距日志通过 Tailscale、ZeroTier 或局域网实时共享给远端调试人员。
 - **Hex (16进制) 模式收发与断帧自愈**：
   - 自动将串口二进制流格式化为 `DE AD BE EF`。
   - 内置基于 **30ms静默超时 (Inter-Byte Timeout)** 缓冲机制，完美解决高速连续二进制流常见的终端断行、分片（Fragmentation）显示问题。
-  - 支持在控制台直接输入 `5A A7 00` 发送 Hex 报文。
+  - 支持在控制台直接输入 `5A A7 00`（以及单字符自动补零如 `01 C 0 0`）发送 Hex 报文。
+- **低内存占用与无色模式 (`--no-color`)**：默认合并每行冗余 ANSI 颜色控制序列；支持开启 `--no-color` 纯文本单色显示，大幅降低长时间运行下 Terminal 模拟器的回滚缓存（Scrollback Buffer）RAM 占用。
 - **文件持久化**：一键同步将所有日志以去色后的纯文本格式追加写入本地磁盘日志文件 (`-o / --out`)。
 
 ---
 
 ## 🚀 快速使用指南 (Usage)
 
-你可以通过命令行传入一个或多个串口配置，形如 `-p 串口名称,波特率,别名`。
+你可以通过命令行传入一个或多个串口配置，形如 `-p COMx[,Baud[,Alias[,Mode[,EOL]]]]`。
 
 ```bash
 # 列出当前系统中所有可用串口
@@ -40,17 +41,29 @@ Multi-UART Logger 是一款使用 Go 语言开发的轻量级、跨平台、高�
 # 开启全局 Hex 数据模式，并将聚合日志保存到 serial_log.txt
 ./multi_uart_logger -p COM26,921600 --hex --out serial_log.txt
 
-# 混合模式：开启全局 Hex，但使用 -m 将 COM23 单独指定为普通文本模式
-./multi_uart_logger -p COM23 -p COM24 -p COM25 --hex -m COM23,text
+# 混合模式：开启全局 Hex，但使用占位符将 COM3 单独覆盖为普通文本模式
+./multi_uart_logger -p COM3 COM4 COM5 --hex -p COM3,-,-,text
 
-# 内联模式：直接在 -p 传参中指定各个串口的模式
-./multi_uart_logger -p COM23,115200,A1,text -p COM24,921600,A2,hex
+# 内联模式与独立换行符 (EOL) 配置：直接在 -p 传参中指定模式与行尾换行符
+./multi_uart_logger -p COM23,115200,A1,text,lf -p "COM24,,,,cr" --eol crlf
+
+# 长时间挂机低内存模式：禁用 ANSI 颜色输出并保存日志
+./multi_uart_logger -p COM23,115200 -p COM24,115200 --no-color -o serial_log.txt
+
+# 纯净终端直通 + 单键实时透传模式 (对齐 MobaXterm 单键菜单交互)
+./multi_uart_logger -p COM24 --plain --char
 ```
 
 ### 命令说明
-你可以使用 `help` 或 `--help` 随时查看所有命令行参数：
-* `-p` 或 `--port` : 串口配置参数，格式为 `COMx,Baud[,Alias[,Mode]]`（如 `-p COM25,115200,A1,hex` 或 `-p COM25,hex`）
-* `-m` 或 `--mode` : 单独设定或覆盖指定串口的收发模式，格式为 `COMx,hex` 或 `COMx,text`（支持以逗号/等号/冒号分隔，或多次指定 `-m`）
+你可以使用 `-h` 或 `--help` 随时查看所有命令行参数：
+* `-p` 或 `--port` : 串口配置参数，格式为 `COMx[,Baud[,Alias[,Mode[,EOL]]]]`（如 `-p COM25,115200,A1,text,lf` 或占位覆盖 `-p COM3,-,-,text`）
+* `--plain` 或 `--no-prefix` : 纯净终端直通模式（隐藏端口名、时间戳及方向箭头，支持 `\r` 原地刷新）
+* `--char` 或 `--raw-input` : 单键实时透传模式（按键即刻发送无需回车，支持单键菜单交互）
+* `--no-color` : 禁用 ANSI 颜色输出（纯文本单色显示，大幅降低终端模拟器滚屏缓存内存占用）
+* `--no-time` : 隐藏时间戳（保留端口名及方向箭头）
+* `--full-date` : 时间戳显示完整年份（格式：`YYYY-MM-DD HH:MM:SS.uuuuuu`）
+* `--time-only` : 时间戳仅显示时分秒微秒（格式：`HH:MM:SS.uuuuuu`）
+* `--eol` : 全局文本模式发送行尾换行符：`crlf`（默认）、`lf`、`cr`、`none`
 * `-l` 或 `--list` : 列出当前系统中所有可用串口并退出
 * `-L` 或 `--listen`: 启动 Telnet 监听服务的 `IP:Port`
 * `--user` : Telnet 登录认证用户名 (留空则无密码)
@@ -61,7 +74,7 @@ Multi-UART Logger 是一款使用 Go 语言开发的轻量级、跨平台、高�
 
 ### 运行中交互命令 (CLI Commands)
 * **终端所有文本与命令**（如 `exit`、`quit`、`help`、`sys: ...`）: 100% 毫无保留地直接透传下发给串口。
-* **`Ctrl+[`** (或输入 `ctrl+[` / `ctrl-[`) : 退出 `multi_uart_logger` 程序的**唯一指令**。
+* **`Ctrl+]`** : 退出 `multi_uart_logger` 程序的快捷键。
 * **`Ctrl+C`** (快捷键/信号) : 捕获 SIGINT 并向所有串口广播下发 `0x03` 控制信号。
 * **`Ctrl+Z` / `Ctrl+D`** (快捷键/EOF) : 捕获终端 EOF 并向所有串口广播下发 `0x1A` / `0x04` 控制信号。
 * **`ctrl-a` ~ `ctrl-z`** (文本快捷指令) : 支持直接输入控制信号文本（如 `ctrl-c` 发送 `0x03`，`ctrl-z` 发送 `0x1A`，`ctrl-d` 发送 `0x04`，`ctrl-\` 发送 `0x1C`）。支持定向下发（如 `A1: ctrl-c` 或 `62-ctrl-z`）。
@@ -90,8 +103,9 @@ go version
 ```
 
 ### 2. 初始化与下载依赖
-在项目根目录（`multi_uart_logger.go` 所在目录），首先执行以下命令下载所需的串口依赖包：
+在项目根目录（`multi_uart_logger.go` 所在目录），首先执行以下命令初始化模块并下载所需的串口依赖包：
 ```bash
+go mod init multi_uart_logger
 go mod tidy
 ```
 
