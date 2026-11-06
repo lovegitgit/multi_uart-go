@@ -54,6 +54,7 @@ var (
 	plainMode          bool
 	noTime             bool
 	charMode           bool
+	noColor            bool
 	logFileWriter      *os.File
 
 	origTerminalState *term.State
@@ -101,6 +102,89 @@ func formatEOLDesc(eol string) string {
 	default:
 		return fmt.Sprintf("%q", eol)
 	}
+}
+
+// parseSGRSeq checks if s[pos:] starts with an ANSI SGR sequence (\x1b[...m).
+// Returns the parameter substring, the index after 'm', and true if matched.
+func parseSGRSeq(s string, pos int) (string, int, bool) {
+	n := len(s)
+	if pos+2 >= n || s[pos] != 0x1b || s[pos+1] != '[' {
+		return "", pos, false
+	}
+	j := pos + 2
+	for j < n && ((s[j] >= '0' && s[j] <= '9') || s[j] == ';') {
+		j++
+	}
+	if j < n && s[j] == 'm' {
+		return s[pos+2 : j], j + 1, true
+	}
+	return "", pos, false
+}
+
+// processANSIColor strips all ANSI SGR color sequences when stripAll is true (--no-color),
+// or merges consecutive/redundant SGR sequences (e.g. \x1b[1m\x1b[32m -> \x1b[1;32m) when stripAll is false.
+func processANSIColor(s string, stripAll bool) string {
+	if !strings.Contains(s, "\x1b[") {
+		return s
+	}
+	n := len(s)
+	if !stripAll {
+		// Fast path: check if adjacent SGR sequences actually exist before allocating
+		hasRedundant := false
+		for i := 0; i < n; {
+			if _, nextIdx, ok := parseSGRSeq(s, i); ok {
+				if _, _, ok2 := parseSGRSeq(s, nextIdx); ok2 {
+					hasRedundant = true
+					break
+				}
+				i = nextIdx
+			} else {
+				i++
+			}
+		}
+		if !hasRedundant {
+			return s
+		}
+	}
+
+	var sb strings.Builder
+	sb.Grow(n)
+	for i := 0; i < n; {
+		params, nextIdx, ok := parseSGRSeq(s, i)
+		if !ok {
+			sb.WriteByte(s[i])
+			i++
+			continue
+		}
+		if stripAll {
+			i = nextIdx
+			continue
+		}
+		// Merge any immediately following SGR sequences into a single sequence
+		merged := params
+		if merged == "" {
+			merged = "0"
+		}
+		i = nextIdx
+		for {
+			nextParams, nextIdx2, ok2 := parseSGRSeq(s, i)
+			if !ok2 {
+				break
+			}
+			if nextParams == "" || nextParams == "0" {
+				merged = "0" // Reset overrides all preceding SGR attributes
+			} else if merged == "0" {
+				merged = "0;" + nextParams
+			} else if merged != nextParams {
+				merged = merged + ";" + nextParams
+			}
+			i = nextIdx2
+		}
+		sb.WriteString("\x1b[")
+		sb.WriteString(merged)
+		sb.WriteByte('m')
+	}
+	return sb.String()
 }
 
 // LogMessage represents a framed log line from a specific port
@@ -155,6 +239,7 @@ func main() {
 	flag.BoolVar(&plainMode, "plain", false, "纯净终端直通模式 (隐藏端口名、时间戳及方向箭头，如 PuTTY/minicom)")
 	flag.BoolVar(&plainMode, "no-prefix", false, "同 --plain")
 	flag.BoolVar(&noTime, "no-time", false, "隐藏时间戳 (保留端口名及方向箭头)")
+	flag.BoolVar(&noColor, "no-color", false, "禁用 ANSI 颜色输出 (纯文本单色显示，降低终端滚屏缓存内存占用)")
 	flag.BoolVar(&charMode, "char", false, "单键实时透传模式 (按键即刻发送无需回车，支持 MobaXterm 单键菜单交互)")
 	flag.BoolVar(&charMode, "raw-input", false, "同 --char")
 
@@ -174,6 +259,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --plain\n\t纯净终端直通模式 (隐藏端口名、时间戳及方向箭头，支持 \\r 原地刷新，如 MobaXterm 原生终端)\n")
 		fmt.Fprintf(os.Stderr, "  --char\n\t单键实时透传模式 (按键即刻发送无需回车，支持 MobaXterm 单键菜单交互)\n")
 		fmt.Fprintf(os.Stderr, "  --no-time\n\t隐藏时间戳 (保留端口名及方向箭头)\n")
+		fmt.Fprintf(os.Stderr, "  --no-color\n\t禁用 ANSI 颜色输出 (纯文本单色显示，降低终端滚屏缓存内存占用)\n")
 		fmt.Fprintf(os.Stderr, "  --eol string\n\t全局文本模式发送行尾换行符: crlf (默认), lf, cr, none\n")
 		fmt.Fprintf(os.Stderr, "  -l, --list\n\t列出当前系统所有可用串口并退出\n")
 		fmt.Fprintf(os.Stderr, "  -L, --listen string\n\t启动 Telnet 转发服务，格式: ip:port (如: --listen 0.0.0.0:8023)\n")
@@ -220,6 +306,8 @@ func main() {
 			charMode = true
 		} else if args[i] == "--no-time" || args[i] == "-no-time" {
 			noTime = true
+		} else if args[i] == "--no-color" || args[i] == "-no-color" {
+			noColor = true
 		} else if args[i] == "--hex" || args[i] == "-hex" {
 			hexMode = true
 		} else if (args[i] == "--eol" || args[i] == "-eol") && i+1 < len(args) {
@@ -280,16 +368,28 @@ func main() {
 	fmt.Printf("\n=======================================================================\n")
 	fmt.Printf(" 🚀 正在启动多串口并发监控 (共 %d 个串口)\n", len(configs))
 	for i, cfg := range configs {
-		color := ansiColors[i%len(ansiColors)]
+		color := ""
+		reset := ""
+		if !noColor {
+			color = ansiColors[i%len(ansiColors)]
+			reset = colorReset
+		}
 		aliasStr := ""
 		if cfg.Alias != cfg.Port {
 			aliasStr = fmt.Sprintf(" (Alias: %s)", cfg.Alias)
 		}
-		modeTag := "\033[1;36m[TEXT]\033[0m"
+		modeTag := "[TEXT]"
 		if cfg.HexMode {
-			modeTag = "\033[1;33m[HEX]\033[0m"
+			modeTag = "[HEX]"
 		}
-		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s | EOL: %s\n", i+1, color, cfg.Port, colorReset, aliasStr, cfg.BaudRate, modeTag, formatEOLDesc(cfg.EOL))
+		if !noColor {
+			if cfg.HexMode {
+				modeTag = "\033[1;33m[HEX]\033[0m"
+			} else {
+				modeTag = "\033[1;36m[TEXT]\033[0m"
+			}
+		}
+		fmt.Printf("   [%d] %s%s%s%s | 波特率: %d | 模式: %s | EOL: %s\n", i+1, color, cfg.Port, reset, aliasStr, cfg.BaudRate, modeTag, formatEOLDesc(cfg.EOL))
 	}
 	if plainMode {
 		fmt.Printf(" 💡 [显示模式] 纯净直通终端模式 (--plain) [无时间戳/前缀，支持 \\r 原地自动刷新，对齐 MobaXterm]\n")
@@ -297,6 +397,9 @@ func main() {
 		fmt.Printf(" 💡 [显示模式] 精简模式 (--no-time) [隐藏时间戳]\n")
 	} else {
 		fmt.Printf(" 💡 [时间戳格式] %s\n", getTimeFormatDesc(showFullDate, timeOnly))
+	}
+	if noColor {
+		fmt.Printf(" 💡 [颜色模式] 无色纯文本模式 (--no-color) [已禁用 ANSI 颜色序列，降低终端缓存占用]\n")
 	}
 	fmt.Printf(" 💡 [发送换行符] 全局默认: %s (可用 --eol 设置全局, 或 -p COMx,,,,<eol> 单独覆盖)\n", formatEOLDesc(globalEOL))
 	if charMode {
@@ -323,10 +426,11 @@ func main() {
 
 	var termFormat, fileFormat string
 	if noTime {
-		termFormat = fmt.Sprintf("%%s[%%-%ds]%%s %%s%%s", maxNameLen)
+		// Merge port tag and direction arrow into a single ANSI color span to halve SGR state switches per line
+		termFormat = fmt.Sprintf("%%s[%%-%ds] %%s%%s%%s", maxNameLen)
 		fileFormat = fmt.Sprintf("[%%-%ds] %%s%%s\n", maxNameLen)
 	} else {
-		termFormat = fmt.Sprintf("%%s[%%-%ds]%%s[%%s] %%s%%s", maxNameLen)
+		termFormat = fmt.Sprintf("%%s[%%-%ds][%%s] %%s%%s%%s", maxNameLen)
 		fileFormat = fmt.Sprintf("[%%-%ds][%%s] %%s%%s\n", maxNameLen)
 	}
 
@@ -388,25 +492,27 @@ func main() {
 			}
 		}
 
-		var dirStrTerm, dirStrFile string
+		var dirStrFile string
 		if msg.Direction == "RX" {
-			dirStrTerm = "\033[1;36m<<\033[0m "
 			dirStrFile = "<< "
 		} else if msg.Direction == "TX" {
-			dirStrTerm = "\033[1;35m>>\033[0m " // Magenta for TX
 			dirStrFile = ">> "
 		} else {
-			dirStrTerm = ""
 			dirStrFile = ""
 		}
 
 		// Ensure content never contains orphan \r that could reset cursor to column 0
 		safeContent := strings.ReplaceAll(msg.Content, "\r", "")
+		safeContent = processANSIColor(safeContent, noColor)
 
 		var termLine, plainLine string
 		if plainMode {
 			if msg.Direction == "SYS" {
-				termLine = fmt.Sprintf("%s%s%s", msg.ColorCode, safeContent, colorReset)
+				if noColor {
+					termLine = safeContent
+				} else {
+					termLine = fmt.Sprintf("%s%s%s", msg.ColorCode, safeContent, colorReset)
+				}
 				plainLine = fmt.Sprintf("[SYS] %s\n", safeContent)
 			} else if msg.Direction == "TX" {
 				// Don't duplicate locally echoed terminal input, but record to file
@@ -417,11 +523,19 @@ func main() {
 			}
 		} else {
 			if noTime {
-				termLine = fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, colorReset, dirStrTerm, safeContent)
 				plainLine = fmt.Sprintf(fileFormat, msg.PortName, dirStrFile, safeContent)
+				if noColor {
+					termLine = plainLine[:len(plainLine)-1]
+				} else {
+					termLine = fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, dirStrFile, colorReset, safeContent)
+				}
 			} else {
-				termLine = fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, colorReset, timeStr, dirStrTerm, safeContent)
 				plainLine = fmt.Sprintf(fileFormat, msg.PortName, timeStr, dirStrFile, safeContent)
+				if noColor {
+					termLine = plainLine[:len(plainLine)-1]
+				} else {
+					termLine = fmt.Sprintf(termFormat, msg.ColorCode, msg.PortName, timeStr, dirStrFile, colorReset, safeContent)
+				}
 			}
 		}
 
@@ -865,7 +979,7 @@ func startStdinCommandReader(activePorts *sync.Map, logChan chan<- LogMessage) {
 
 	moveCursorLeft := func(n int) {
 		if n > 0 {
-			fmt.Print(strings.Repeat("\033[D", n))
+			fmt.Printf("\033[%dD", n)
 		}
 	}
 
